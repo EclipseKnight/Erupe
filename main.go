@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"erupe-ce/config"
+	"erupe-ce/server/apiserver"
 	"erupe-ce/server/channelserver"
 	"erupe-ce/server/discordbot"
 	"erupe-ce/server/entranceserver"
@@ -202,6 +203,9 @@ func main() {
 	for _, c := range channels {
 		c.Channels = channels
 	}
+
+	//Start api server last to avoid any errors from accessing stuff.
+	apiserver.Start()
 
 	// Wait for exit or interrupt with ctrl+C.
 	c := make(chan os.Signal, 1)
