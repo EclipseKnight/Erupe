@@ -1,6 +1,7 @@
 {
   "Host": "127.0.0.1",
   "BinPath": "bin",
+  "Language": "en",
   "DisableSoftCrash": false,
   "FeaturedWeapons": 1,
   "HideLoginNotice": true,
@@ -8,6 +9,7 @@
   "PatchServerManifest": "",
   "PatchServerFile": "",
   "ScreenshotAPIURL": "",
+  "DeleteOnSaveCorruption": false,
   "DevMode": true,
   "DevModeOptions": {
     "AutoCreateAccount": true,

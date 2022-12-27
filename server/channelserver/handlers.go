@@ -141,6 +141,7 @@ func handleMsgSysLogin(s *Session, p mhfpacket.MHFPacket) {
 	s.charID = pkt.CharID0
 	s.token = pkt.LoginTokenString
 	s.Unlock()
+
 	updateRights(s)
 	bf := byteframe.NewByteFrame()
 	bf.WriteUint32(uint32(Time_Current_Adjusted().Unix())) // Unix timestamp
@@ -1500,9 +1501,9 @@ func handleMsgMhfGetEtcPoints(s *Session, p mhfpacket.MHFPacket) {
 
 	resp := byteframe.NewByteFrame()
 	resp.WriteUint8(0x3) // Maybe a count of uint32(s)?
-	resp.WriteUint32(0)
-	resp.WriteUint32(14)
-	resp.WriteUint32(14)
+	resp.WriteUint32(0)  // Point bonus quests
+	resp.WriteUint32(0)  // Daily quests
+	resp.WriteUint32(0)  // HS promotion points
 
 	doAckBufSucceed(s, pkt.AckHandle, resp.Data())
 }
