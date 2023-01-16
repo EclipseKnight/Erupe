@@ -45,6 +45,12 @@ func handleMsgMhfSavedata(s *Session, p mhfpacket.MHFPacket) {
 		characterSaveData.decompSave = saveData
 	}
 	characterSaveData.updateStructWithSaveData()
+
+	// Bypass name-checker if new
+	if characterSaveData.IsNewCharacter == true {
+		s.Name = characterSaveData.Name
+	}
+
 	if characterSaveData.Name == s.Name {
 		characterSaveData.Save(s)
 		s.logger.Info("Wrote recompressed savedata back to DB.")
