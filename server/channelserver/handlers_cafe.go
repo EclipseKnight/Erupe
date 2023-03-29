@@ -2,6 +2,7 @@ package channelserver
 
 import (
 	"erupe-ce/common/byteframe"
+	"erupe-ce/common/mhfcourse"
 	ps "erupe-ce/common/pascalstring"
 	"erupe-ce/network/mhfpacket"
 	"fmt"
@@ -15,7 +16,7 @@ func handleMsgMhfAcquireCafeItem(s *Session, p mhfpacket.MHFPacket) {
 	var netcafePoints uint32
 	err := s.server.db.QueryRow("UPDATE characters SET netcafe_points = netcafe_points - $1 WHERE id = $2 RETURNING netcafe_points", pkt.PointCost, s.charID).Scan(&netcafePoints)
 	if err != nil {
-		s.logger.Fatal("Failed to get netcafe points from db", zap.Error(err))
+		s.logger.Error("Failed to get netcafe points from db", zap.Error(err))
 	}
 	resp := byteframe.NewByteFrame()
 	resp.WriteUint32(netcafePoints)
@@ -27,7 +28,7 @@ func handleMsgMhfUpdateCafepoint(s *Session, p mhfpacket.MHFPacket) {
 	var netcafePoints uint32
 	err := s.server.db.QueryRow("SELECT COALESCE(netcafe_points, 0) FROM characters WHERE id = $1", s.charID).Scan(&netcafePoints)
 	if err != nil {
-		s.logger.Fatal("Failed to get netcate points from db", zap.Error(err))
+		s.logger.Error("Failed to get netcate points from db", zap.Error(err))
 	}
 	resp := byteframe.NewByteFrame()
 	resp.WriteUint32(netcafePoints)
@@ -37,11 +38,8 @@ func handleMsgMhfUpdateCafepoint(s *Session, p mhfpacket.MHFPacket) {
 func handleMsgMhfCheckDailyCafepoint(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfCheckDailyCafepoint)
 
-	// get next midday
-	var t = Time_static()
-	year, month, day := t.Date()
-	midday := time.Date(year, month, day, 12, 0, 0, 0, t.Location())
-	if t.After(midday) {
+	midday := TimeMidnight().Add(12 * time.Hour)
+	if TimeAdjusted().After(midday) {
 		midday = midday.Add(24 * time.Hour)
 	}
 
@@ -49,16 +47,16 @@ func handleMsgMhfCheckDailyCafepoint(s *Session, p mhfpacket.MHFPacket) {
 	var dailyTime time.Time
 	err := s.server.db.QueryRow("SELECT COALESCE(daily_time, $2) FROM characters WHERE id = $1", s.charID, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)).Scan(&dailyTime)
 	if err != nil {
-		s.logger.Fatal("Failed to get daily_time savedata from db", zap.Error(err))
+		s.logger.Error("Failed to get daily_time savedata from db", zap.Error(err))
 	}
 
 	var bondBonus, bonusQuests, dailyQuests uint32
 	bf := byteframe.NewByteFrame()
-	if t.After(dailyTime) {
+	if midday.After(dailyTime) {
 		addPointNetcafe(s, 5)
-		bondBonus = 5   // Bond point bonus quests
-		bonusQuests = 3 // HRP bonus quests?
-		dailyQuests = 1 // Daily quests
+		bondBonus = 5 // Bond point bonus quests
+		bonusQuests = s.server.erupeConfig.GameplayOptions.BonusQuestAllowance
+		dailyQuests = s.server.erupeConfig.GameplayOptions.DailyQuestAllowance
 		s.server.db.Exec("UPDATE characters SET daily_time=$1, bonus_quests = $2, daily_quests = $3 WHERE id=$4", midday, bonusQuests, dailyQuests, s.charID)
 		bf.WriteBool(true) // Success?
 	} else {
@@ -80,7 +78,7 @@ func handleMsgMhfGetCafeDuration(s *Session, p mhfpacket.MHFPacket) {
 		cafeReset = TimeWeekNext()
 		s.server.db.Exec(`UPDATE characters SET cafe_reset=$1 WHERE id=$2`, cafeReset, s.charID)
 	}
-	if Time_Current_Adjusted().After(cafeReset) {
+	if TimeAdjusted().After(cafeReset) {
 		cafeReset = TimeWeekNext()
 		s.server.db.Exec(`UPDATE characters SET cafe_time=0, cafe_reset=$1 WHERE id=$2`, cafeReset, s.charID)
 		s.server.db.Exec(`DELETE FROM cafe_accepted WHERE character_id=$1`, s.charID)
@@ -91,8 +89,8 @@ func handleMsgMhfGetCafeDuration(s *Session, p mhfpacket.MHFPacket) {
 	if err != nil {
 		panic(err)
 	}
-	if s.FindCourse("NetCafe").ID != 0 || s.FindCourse("N").ID != 0 {
-		cafeTime = uint32(Time_Current_Adjusted().Unix()) - uint32(s.sessionStart) + cafeTime
+	if mhfcourse.CourseExists(30, s.courses) {
+		cafeTime = uint32(TimeAdjusted().Unix()) - uint32(s.sessionStart) + cafeTime
 	}
 	bf.WriteUint32(cafeTime) // Total cafe time
 	bf.WriteUint16(0)
@@ -142,7 +140,7 @@ func handleMsgMhfGetCafeDurationBonusInfo(s *Session, p mhfpacket.MHFPacket) {
 		}
 		resp := byteframe.NewByteFrame()
 		resp.WriteUint32(0)
-		resp.WriteUint32(uint32(time.Now().Unix()))
+		resp.WriteUint32(uint32(TimeAdjusted().Unix()))
 		resp.WriteUint32(count)
 		resp.WriteBytes(bf.Data())
 		doAckBufSucceed(s, pkt.AckHandle, resp.Data())
@@ -165,7 +163,7 @@ func handleMsgMhfReceiveCafeDurationBonus(s *Session, p mhfpacket.MHFPacket) {
 		SELECT ch.cafe_time + $2
 		FROM characters ch
 		WHERE ch.id = $1 
-	) >= time_req`, s.charID, Time_Current_Adjusted().Unix()-s.sessionStart)
+	) >= time_req`, s.charID, TimeAdjusted().Unix()-s.sessionStart)
 	if err != nil {
 		doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 	} else {
@@ -210,8 +208,8 @@ func addPointNetcafe(s *Session, p int) error {
 	if err != nil {
 		return err
 	}
-	if points+p > 100000 {
-		points = 100000
+	if points+p > s.server.erupeConfig.GameplayOptions.MaximumNP {
+		points = s.server.erupeConfig.GameplayOptions.MaximumNP
 	} else {
 		points += p
 	}
@@ -222,7 +220,12 @@ func addPointNetcafe(s *Session, p int) error {
 func handleMsgMhfStartBoostTime(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfStartBoostTime)
 	bf := byteframe.NewByteFrame()
-	boostLimit := Time_Current_Adjusted().Add(100 * time.Minute)
+	boostLimit := TimeAdjusted().Add(time.Duration(s.server.erupeConfig.GameplayOptions.BoostTimeDuration) * time.Minute)
+	if s.server.erupeConfig.GameplayOptions.DisableBoostTime {
+		bf.WriteUint32(0)
+		doAckBufSucceed(s, pkt.AckHandle, bf.Data())
+		return
+	}
 	s.server.db.Exec("UPDATE characters SET boost_time=$1 WHERE id=$2", boostLimit, s.charID)
 	bf.WriteUint32(uint32(boostLimit.Unix()))
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
@@ -255,7 +258,7 @@ func handleMsgMhfGetBoostRight(s *Session, p mhfpacket.MHFPacket) {
 		doAckBufSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x00})
 		return
 	}
-	if boostLimit.Unix() > Time_Current_Adjusted().Unix() {
+	if boostLimit.After(TimeAdjusted()) {
 		doAckBufSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x01})
 	} else {
 		doAckBufSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x02})

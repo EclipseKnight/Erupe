@@ -3,8 +3,6 @@ package channelserver
 import (
 	"sync"
 
-	"time"
-
 	"erupe-ce/common/byteframe"
 	"erupe-ce/network/mhfpacket"
 )
@@ -49,7 +47,6 @@ type Stage struct {
 	host       *Session
 	maxPlayers uint16
 	password   string
-	createdAt  string
 }
 
 // NewStage creates a new stage with intialized values.
@@ -62,14 +59,14 @@ func NewStage(ID string) *Stage {
 		objectIndex:         0,
 		rawBinaryData:       make(map[stageBinaryKey][]byte),
 		maxPlayers:          4,
-		createdAt:           time.Now().Format("01-02-2006 15:04:05"),
 	}
 	return s
 }
 
 // BroadcastMHF queues a MHFPacket to be sent to all sessions in the stage.
 func (s *Stage) BroadcastMHF(pkt mhfpacket.MHFPacket, ignoredSession *Session) {
-	// Broadcast the data.
+	s.Lock()
+	defer s.Unlock()
 	for session := range s.clients {
 		if session == ignoredSession {
 			continue

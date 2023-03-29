@@ -38,6 +38,7 @@ type Server struct {
 	sync.Mutex
 	Channels       []*Server
 	ID             uint16
+	GlobalID       string
 	IP             string
 	Port           uint16
 	logger         *zap.Logger
@@ -92,8 +93,7 @@ type RavienteRegister struct {
 }
 
 type RavienteState struct {
-	damageMultiplier uint32
-	stateData        []uint32
+	stateData []uint32
 }
 
 type RavienteSupport struct {
@@ -111,9 +111,7 @@ func NewRaviente() *Raviente {
 		maxPlayers:   0,
 		carveQuest:   0,
 	}
-	ravienteState := &RavienteState{
-		damageMultiplier: 1,
-	}
+	ravienteState := &RavienteState{}
 	ravienteSupport := &RavienteSupport{}
 	ravienteRegister.register = []uint32{0, 0, 0, 0, 0}
 	ravienteState.stateData = []uint32{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
@@ -125,6 +123,23 @@ func NewRaviente() *Raviente {
 		support:  ravienteSupport,
 	}
 	return raviente
+}
+
+func (r *Raviente) GetRaviMultiplier(s *Server) float64 {
+	raviSema := getRaviSemaphore(s)
+	if raviSema != nil {
+		var minPlayers int
+		if r.register.maxPlayers > 8 {
+			minPlayers = 24
+		} else {
+			minPlayers = 4
+		}
+		if len(raviSema.clients) > minPlayers {
+			return 1
+		}
+		return float64(minPlayers / len(raviSema.clients))
+	}
+	return 0
 }
 
 // NewServer creates a new Server type.
@@ -255,6 +270,8 @@ func (s *Server) manageSessions() {
 // BroadcastMHF queues a MHFPacket to be sent to all sessions.
 func (s *Server) BroadcastMHF(pkt mhfpacket.MHFPacket, ignoredSession *Session) {
 	// Broadcast the data.
+	s.Lock()
+	defer s.Unlock()
 	for _, session := range s.sessions {
 		if session == ignoredSession {
 			continue
@@ -277,16 +294,7 @@ func (s *Server) WorldcastMHF(pkt mhfpacket.MHFPacket, ignoredSession *Session, 
 		if c == ignoredChannel {
 			continue
 		}
-		for _, session := range c.sessions {
-			if session == ignoredSession {
-				continue
-			}
-			bf := byteframe.NewByteFrame()
-			bf.WriteUint16(uint16(pkt.Opcode()))
-			pkt.Build(bf, session.clientContext)
-			bf.WriteUint16(0x0010)
-			session.QueueSendNonBlocking(bf.Data())
-		}
+		c.BroadcastMHF(pkt, ignoredSession)
 	}
 }
 
