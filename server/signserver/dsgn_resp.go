@@ -5,6 +5,7 @@ import (
 	ps "erupe-ce/common/pascalstring"
 	"erupe-ce/common/stringsupport"
 	"erupe-ce/common/token"
+	_config "erupe-ce/config"
 	"erupe-ce/server/channelserver"
 	"fmt"
 	"go.uber.org/zap"
@@ -14,6 +15,12 @@ import (
 func (s *Session) makeSignResponse(uid int) []byte {
 	// Get the characters from the DB.
 	chars, err := s.server.getCharactersForUser(uid)
+	if len(chars) == 0 {
+		err = s.server.newUserChara(uid)
+		if err == nil {
+			chars, err = s.server.getCharactersForUser(uid)
+		}
+	}
 	if err != nil {
 		s.logger.Warn("Error getting characters from DB", zap.Error(err))
 	}
@@ -23,7 +30,7 @@ func (s *Session) makeSignResponse(uid int) []byte {
 
 	bf := byteframe.NewByteFrame()
 
-	bf.WriteUint8(1) // resp_code
+	bf.WriteUint8(uint8(SIGN_SUCCESS)) // resp_code
 	if (s.server.erupeConfig.PatchServerManifest != "" && s.server.erupeConfig.PatchServerFile != "") || s.client == PS3 {
 		bf.WriteUint8(2)
 	} else {
@@ -71,15 +78,23 @@ func (s *Session) makeSignResponse(uid int) []byte {
 		bf.WriteBool(true)                                                       // Use uint16 GR, no reason not to
 		bf.WriteBytes(stringsupport.PaddedString(char.Name, 16, true))           // Character name
 		bf.WriteBytes(stringsupport.PaddedString(char.UnkDescString, 32, false)) // unk str
-		bf.WriteUint16(char.GR)
-		bf.WriteUint16(0) // Unk
+		if s.server.erupeConfig.RealClientMode >= _config.G7 {
+			bf.WriteUint16(char.GR)
+			bf.WriteUint8(0) // Unk
+			bf.WriteUint8(0) // Unk
+		}
 	}
 
 	friends := s.server.getFriendsForCharacters(chars)
 	if len(friends) == 0 {
 		bf.WriteUint8(0)
 	} else {
-		bf.WriteUint8(uint8(len(friends)))
+		if len(friends) > 255 {
+			bf.WriteUint8(255)
+			bf.WriteUint16(uint16(len(friends)))
+		} else {
+			bf.WriteUint8(uint8(len(friends)))
+		}
 		for _, friend := range friends {
 			bf.WriteUint32(friend.CID)
 			bf.WriteUint32(friend.ID)
@@ -91,7 +106,12 @@ func (s *Session) makeSignResponse(uid int) []byte {
 	if len(guildmates) == 0 {
 		bf.WriteUint8(0)
 	} else {
-		bf.WriteUint8(uint8(len(guildmates)))
+		if len(guildmates) > 255 {
+			bf.WriteUint8(255)
+			bf.WriteUint16(uint16(len(guildmates)))
+		} else {
+			bf.WriteUint8(uint8(len(guildmates)))
+		}
 		for _, guildmate := range guildmates {
 			bf.WriteUint32(guildmate.CID)
 			bf.WriteUint32(guildmate.ID)
@@ -103,7 +123,9 @@ func (s *Session) makeSignResponse(uid int) []byte {
 		bf.WriteBool(false)
 	} else {
 		bf.WriteBool(true)
-		ps.Uint32(bf, strings.Join(s.server.erupeConfig.LoginNotices[:], "<PAGE>"), true)
+		bf.WriteUint8(0)
+		bf.WriteUint8(0)
+		ps.Uint16(bf, strings.Join(s.server.erupeConfig.LoginNotices[:], "<PAGE>"), true)
 	}
 
 	bf.WriteUint32(s.server.getLastCID(uid))
@@ -123,12 +145,13 @@ func (s *Session) makeSignResponse(uid int) []byte {
 	bf.WriteUint16(0x4E20)
 	ps.Uint16(bf, "", false) // unk ipv4
 	bf.WriteUint32(uint32(s.server.getReturnExpiry(uid).Unix()))
-	bf.WriteUint32(0x00000000)
-	bf.WriteUint32(0x0A5197DF) // unk id
+	bf.WriteUint32(0)
 
 	mezfes := s.server.erupeConfig.DevModeOptions.MezFesEvent
 	alt := s.server.erupeConfig.DevModeOptions.MezFesAlt
 	if mezfes {
+		// We can just use the start timestamp as the event ID
+		bf.WriteUint32(uint32(channelserver.TimeWeekStart().Unix()))
 		// Start time
 		bf.WriteUint32(uint32(channelserver.TimeWeekStart().Unix()))
 		// End time
@@ -136,20 +159,21 @@ func (s *Session) makeSignResponse(uid int) []byte {
 		bf.WriteUint8(2) // Unk
 		bf.WriteUint32(s.server.erupeConfig.GameplayOptions.MezfesSoloTickets)
 		bf.WriteUint32(s.server.erupeConfig.GameplayOptions.MezfesGroupTickets)
-		bf.WriteUint8(8)   // Stalls open
-		bf.WriteUint8(0xA) // Unk
-		bf.WriteUint8(0x3) // Pachinko
-		bf.WriteUint8(0x6) // Nyanrendo
-		bf.WriteUint8(0x9) // Point stall
+		bf.WriteUint8(8)  // Stalls open
+		bf.WriteUint8(10) // Stall Map
+		bf.WriteUint8(3)  // Pachinko
+		bf.WriteUint8(6)  // Nyanrendo
+		bf.WriteUint8(9)  // Point stall
 		if alt {
-			bf.WriteUint8(0x2) // Tokotoko
+			bf.WriteUint8(2) // Tokotoko Partnya
 		} else {
-			bf.WriteUint8(0x4) // Volpakkun
+			bf.WriteUint8(4) // Volpakkun Together
 		}
-		bf.WriteUint8(0x8) // Battle cats
-		bf.WriteUint8(0x5) // Gook
-		bf.WriteUint8(0x7) // Honey
+		bf.WriteUint8(8) // Dokkan Battle Cats
+		bf.WriteUint8(5) // Goocoo Scoop
+		bf.WriteUint8(7) // Honey Panic
 	} else {
+		bf.WriteUint32(0)
 		bf.WriteUint32(0)
 		bf.WriteUint32(0)
 	}

@@ -60,7 +60,7 @@ func (s *Session) handlePacket(pkt []byte) error {
 	case "VITASGN:100":
 		s.client = VITA
 		s.handlePSSGN(bf)
-	case "WIIUSGN:100":
+	case "WIIUSGN:100", "WIIUSGN:000":
 		s.client = WIIU
 		s.handleWIIUSGN(bf)
 	case "DELETE:100":
@@ -99,7 +99,7 @@ func (s *Session) authenticate(username string, password string) {
 		s.logger.Info("User not found", zap.String("Username", username))
 		if s.server.erupeConfig.DevMode && s.server.erupeConfig.DevModeOptions.AutoCreateAccount {
 			s.logger.Info("Creating user", zap.String("Username", username))
-			err = s.server.registerDBAccount(username, password)
+			id, err = s.server.registerDBAccount(username, password)
 			if err == nil {
 				bf.WriteBytes(s.makeSignResponse(id))
 			}
@@ -113,7 +113,7 @@ func (s *Session) authenticate(username string, password string) {
 		if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil || s.client == VITA || s.client == PS3 || s.client == WIIU {
 			s.logger.Debug("Passwords match!")
 			if newCharaReq {
-				err = s.server.newUserChara(username)
+				err = s.server.newUserChara(id)
 				if err != nil {
 					s.logger.Error("Error adding new character to user", zap.Error(err))
 					bf.WriteUint8(uint8(SIGN_EABORT))
@@ -156,6 +156,13 @@ func (s *Session) handleWIIUSGN(bf *byteframe.ByteFrame) {
 }
 
 func (s *Session) handlePSSGN(bf *byteframe.ByteFrame) {
+	// Prevent reading malformed request
+	if len(bf.DataFromCurrent()) < 128 {
+		resp := byteframe.NewByteFrame()
+		resp.WriteUint8(uint8(SIGN_EABORT))
+		s.cryptConn.SendPacket(resp.Data())
+		return
+	}
 	_ = bf.ReadNullTerminatedBytes() // VITA = 0000000256, PS3 = 0000000255
 	_ = bf.ReadBytes(2)              // VITA = 1, PS3 = !
 	_ = bf.ReadBytes(82)
