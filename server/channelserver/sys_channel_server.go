@@ -125,21 +125,22 @@ func NewRaviente() *Raviente {
 	return raviente
 }
 
-func (r *Raviente) GetRaviMultiplier(s *Server) float64 {
-	raviSema := getRaviSemaphore(s)
-	if raviSema != nil {
-		var minPlayers int
-		if r.register.maxPlayers > 8 {
-			minPlayers = 24
-		} else {
-			minPlayers = 4
-		}
-		if len(raviSema.clients) > minPlayers {
-			return 1
-		}
-		return float64(minPlayers / len(raviSema.clients))
-	}
-	return 0
+ func (r *Raviente) GetRaviMultiplier(s *Server) float64 {
+	return 32
+// 	raviSema := getRaviSemaphore(s)
+// 	if raviSema != nil {
+// 		var minPlayers int
+// 		if r.register.maxPlayers > 8 {
+// 			minPlayers = 24
+// 		} else {
+// 			minPlayers = 4
+// 		}
+// 		if len(raviSema.clients) > minPlayers {
+// 			return 1
+// 		}
+// 		return float64(minPlayers / len(raviSema.clients))
+// 	}
+// 	return 0
 }
 
 // NewServer creates a new Server type.
