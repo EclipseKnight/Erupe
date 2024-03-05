@@ -1,16 +1,20 @@
 package channelserver
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"erupe-ce/common/byteframe"
+	"erupe-ce/common/mhfcid"
 	"erupe-ce/common/mhfcourse"
 	"erupe-ce/common/token"
 	"erupe-ce/config"
+	"erupe-ce/network"
 	"erupe-ce/network/binpacket"
 	"erupe-ce/network/mhfpacket"
 	"fmt"
 	"golang.org/x/exp/slices"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,16 +39,16 @@ const (
 	BroadcastTypeWorld    = 0x0a
 )
 
-var commands map[string]config.Command
+var commands map[string]_config.Command
 
 func init() {
-	commands = make(map[string]config.Command)
+	commands = make(map[string]_config.Command)
 	zapConfig := zap.NewDevelopmentConfig()
 	zapConfig.DisableCaller = true
 	zapLogger, _ := zapConfig.Build()
 	defer zapLogger.Sync()
 	logger := zapLogger.Named("commands")
-	cmds := config.ErupeConfig.Commands
+	cmds := _config.ErupeConfig.Commands
 	for _, cmd := range cmds {
 		commands[cmd.Name] = cmd
 		if cmd.Enabled {
@@ -55,8 +59,8 @@ func init() {
 	}
 }
 
-func sendDisabledCommandMessage(s *Session, cmd config.Command) {
-	sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandDisabled"], cmd.Name))
+func sendDisabledCommandMessage(s *Session, cmd _config.Command) {
+	sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.disabled, cmd.Name))
 }
 
 func sendServerChatMessage(s *Session, message string) {
@@ -73,7 +77,7 @@ func sendServerChatMessage(s *Session, message string) {
 	msgBinChat.Build(bf)
 
 	castedBin := &mhfpacket.MsgSysCastedBinary{
-		CharID:         s.charID,
+		CharID:         0,
 		MessageType:    BinaryMessageTypeChat,
 		RawDataPayload: bf.Data(),
 	}
@@ -82,25 +86,99 @@ func sendServerChatMessage(s *Session, message string) {
 }
 
 func parseChatCommand(s *Session, command string) {
-	if strings.HasPrefix(command, commands["PSN"].Prefix) {
-		if commands["PSN"].Enabled {
-			var id string
-			n, err := fmt.Sscanf(command, fmt.Sprintf("%s %%s", commands["PSN"].Prefix), &id)
-			if err != nil || n != 1 {
-				sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandPSNError"], commands["PSN"].Prefix))
-			} else {
-				_, err = s.server.db.Exec(`UPDATE users u SET psn_id=$1 WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$2)`, id, s.charID)
-				if err == nil {
-					sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandPSNSuccess"], id))
+	args := strings.Split(command[len(s.server.erupeConfig.CommandPrefix):], " ")
+	switch args[0] {
+	case commands["Ban"].Prefix:
+		if s.isOp() {
+			if len(args) > 1 {
+				var expiry time.Time
+				if len(args) > 2 {
+					var length int
+					var unit string
+					n, err := fmt.Sscanf(args[2], `%d%s`, &length, &unit)
+					if err == nil && n == 2 {
+						switch unit {
+						case "s", "second", "seconds":
+							expiry = time.Now().Add(time.Duration(length) * time.Second)
+						case "m", "mi", "minute", "minutes":
+							expiry = time.Now().Add(time.Duration(length) * time.Minute)
+						case "h", "hour", "hours":
+							expiry = time.Now().Add(time.Duration(length) * time.Hour)
+						case "d", "day", "days":
+							expiry = time.Now().Add(time.Duration(length) * time.Hour * 24)
+						case "mo", "month", "months":
+							expiry = time.Now().Add(time.Duration(length) * time.Hour * 24 * 30)
+						case "y", "year", "years":
+							expiry = time.Now().Add(time.Duration(length) * time.Hour * 24 * 365)
+						}
+					} else {
+						sendServerChatMessage(s, s.server.i18n.commands.ban.error)
+						return
+					}
 				}
+				cid := mhfcid.ConvertCID(args[1])
+				if cid > 0 {
+					var uid uint32
+					var uname string
+					err := s.server.db.QueryRow(`SELECT id, username FROM users u WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$1)`, cid).Scan(&uid, &uname)
+					if err == nil {
+						if expiry.IsZero() {
+							s.server.db.Exec(`INSERT INTO bans VALUES ($1)
+                 				ON CONFLICT (user_id) DO UPDATE SET expires=NULL`, uid)
+							sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.ban.success, uname))
+						} else {
+							s.server.db.Exec(`INSERT INTO bans VALUES ($1, $2)
+                 				ON CONFLICT (user_id) DO UPDATE SET expires=$2`, uid, expiry)
+							sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.ban.success, uname)+fmt.Sprintf(s.server.i18n.commands.ban.length, expiry.Format(time.DateTime)))
+						}
+						s.server.DisconnectUser(uid)
+					} else {
+						sendServerChatMessage(s, s.server.i18n.commands.ban.noUser)
+					}
+				} else {
+					sendServerChatMessage(s, s.server.i18n.commands.ban.invalid)
+				}
+			} else {
+				sendServerChatMessage(s, s.server.i18n.commands.ban.error)
 			}
+		} else {
+			sendServerChatMessage(s, s.server.i18n.commands.noOp)
 		}
-	}
-
-	if strings.HasPrefix(command, commands["Reload"].Prefix) {
-		// Flush all objects and users and reload
-		if commands["Reload"].Enabled {
-			sendServerChatMessage(s, s.server.dict["commandReload"])
+	case commands["Timer"].Prefix:
+		if commands["Timer"].Enabled || s.isOp() {
+			var state bool
+			s.server.db.QueryRow(`SELECT COALESCE(timer, false) FROM users u WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$1)`, s.charID).Scan(&state)
+			s.server.db.Exec(`UPDATE users u SET timer=$1 WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$2)`, !state, s.charID)
+			if state {
+				sendServerChatMessage(s, s.server.i18n.commands.timer.disabled)
+			} else {
+				sendServerChatMessage(s, s.server.i18n.commands.timer.enabled)
+			}
+		} else {
+			sendDisabledCommandMessage(s, commands["Timer"])
+		}
+	case commands["PSN"].Prefix:
+		if commands["PSN"].Enabled || s.isOp() {
+			if len(args) > 1 {
+				var exists int
+				s.server.db.QueryRow(`SELECT count(*) FROM users WHERE psn_id = $1`, args[1]).Scan(&exists)
+				if exists == 0 {
+					_, err := s.server.db.Exec(`UPDATE users u SET psn_id=$1 WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$2)`, args[1], s.charID)
+					if err == nil {
+						sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.psn.success, args[1]))
+					}
+				} else {
+					sendServerChatMessage(s, s.server.i18n.commands.psn.exists)
+				}
+			} else {
+				sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.psn.error, commands["PSN"].Prefix))
+			}
+		} else {
+			sendDisabledCommandMessage(s, commands["PSN"])
+		}
+	case commands["Reload"].Prefix:
+		if commands["Reload"].Enabled || s.isOp() {
+			sendServerChatMessage(s, s.server.i18n.commands.reload)
 			var temp mhfpacket.MHFPacket
 			deleteNotif := byteframe.NewByteFrame()
 			for _, object := range s.stage.objects {
@@ -119,7 +197,7 @@ func parseChatCommand(s *Session, command string) {
 				deleteNotif.WriteUint16(uint16(temp.Opcode()))
 				temp.Build(deleteNotif, s.clientContext)
 			}
-			deleteNotif.WriteUint16(0x0010)
+			deleteNotif.WriteUint16(uint16(network.MSG_SYS_END))
 			s.QueueSend(deleteNotif.Data())
 			time.Sleep(500 * time.Millisecond)
 			reloadNotif := byteframe.NewByteFrame()
@@ -154,69 +232,62 @@ func parseChatCommand(s *Session, command string) {
 				reloadNotif.WriteUint16(uint16(temp.Opcode()))
 				temp.Build(reloadNotif, s.clientContext)
 			}
-			reloadNotif.WriteUint16(0x0010)
+			reloadNotif.WriteUint16(uint16(network.MSG_SYS_END))
 			s.QueueSend(reloadNotif.Data())
 		} else {
 			sendDisabledCommandMessage(s, commands["Reload"])
 		}
-	}
-
-	if strings.HasPrefix(command, commands["KeyQuest"].Prefix) {
-		if commands["KeyQuest"].Enabled {
-			if strings.HasPrefix(command, fmt.Sprintf("%s get", commands["KeyQuest"].Prefix)) {
-				sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandKqfGet"], s.kqf))
-			} else if strings.HasPrefix(command, fmt.Sprintf("%s set", commands["KeyQuest"].Prefix)) {
-				var hexs string
-				n, numerr := fmt.Sscanf(command, fmt.Sprintf("%s set %%s", commands["KeyQuest"].Prefix), &hexs)
-				if numerr != nil || n != 1 || len(hexs) != 16 {
-					sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandKqfSetError"], commands["KeyQuest"].Prefix))
-				} else {
-					hexd, _ := hex.DecodeString(hexs)
-					s.kqf = hexd
-					s.kqfOverride = true
-					sendServerChatMessage(s, s.server.dict["commandKqfSetSuccess"])
+	case commands["KeyQuest"].Prefix:
+		if commands["KeyQuest"].Enabled || s.isOp() {
+			if s.server.erupeConfig.RealClientMode < _config.G10 {
+				sendServerChatMessage(s, s.server.i18n.commands.kqf.version)
+			} else {
+				if len(args) > 1 {
+					if args[1] == "get" {
+						sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.kqf.get, s.kqf))
+					} else if args[1] == "set" {
+						if len(args) > 2 && len(args[2]) == 16 {
+							hexd, _ := hex.DecodeString(args[2])
+							s.kqf = hexd
+							s.kqfOverride = true
+							sendServerChatMessage(s, s.server.i18n.commands.kqf.set.success)
+						} else {
+							sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.kqf.set.error, commands["KeyQuest"].Prefix))
+						}
+					}
 				}
 			}
 		} else {
 			sendDisabledCommandMessage(s, commands["KeyQuest"])
 		}
-	}
-
-	if strings.HasPrefix(command, commands["Rights"].Prefix) {
-		// Set account rights
-		if commands["Rights"].Enabled {
-			var v uint32
-			n, err := fmt.Sscanf(command, fmt.Sprintf("%s %%d", commands["Rights"].Prefix), &v)
-			if err != nil || n != 1 {
-				sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandRightsError"], commands["Rights"].Prefix))
-			} else {
-				_, err = s.server.db.Exec("UPDATE users u SET rights=$1 WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$2)", v, s.charID)
+	case commands["Rights"].Prefix:
+		if commands["Rights"].Enabled || s.isOp() {
+			if len(args) > 1 {
+				v, _ := strconv.Atoi(args[1])
+				_, err := s.server.db.Exec("UPDATE users u SET rights=$1 WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$2)", v, s.charID)
 				if err == nil {
-					sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandRightsSuccess"], v))
+					sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.rights.success, v))
+				} else {
+					sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.rights.error, commands["Rights"].Prefix))
 				}
+			} else {
+				sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.rights.error, commands["Rights"].Prefix))
 			}
 		} else {
 			sendDisabledCommandMessage(s, commands["Rights"])
 		}
-	}
-
-	if strings.HasPrefix(command, commands["Course"].Prefix) {
-		if commands["Course"].Enabled {
-			var name string
-			n, err := fmt.Sscanf(command, fmt.Sprintf("%s %%s", commands["Course"].Prefix), &name)
-			if err != nil || n != 1 {
-				sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandCourseError"], commands["Course"].Prefix))
-			} else {
-				name = strings.ToLower(name)
+	case commands["Course"].Prefix:
+		if commands["Course"].Enabled || s.isOp() {
+			if len(args) > 1 {
 				for _, course := range mhfcourse.Courses() {
 					for _, alias := range course.Aliases() {
-						if strings.ToLower(name) == strings.ToLower(alias) {
-							if slices.Contains(s.server.erupeConfig.Courses, config.Course{Name: course.Aliases()[0], Enabled: true}) {
+						if strings.ToLower(args[1]) == strings.ToLower(alias) {
+							if slices.Contains(s.server.erupeConfig.Courses, _config.Course{Name: course.Aliases()[0], Enabled: true}) {
 								var delta, rightsInt uint32
 								if mhfcourse.CourseExists(course.ID, s.courses) {
 									ei := slices.IndexFunc(s.courses, func(c mhfcourse.Course) bool {
 										for _, alias := range c.Aliases() {
-											if strings.ToLower(name) == strings.ToLower(alias) {
+											if strings.ToLower(args[1]) == strings.ToLower(alias) {
 												return true
 											}
 										}
@@ -224,103 +295,127 @@ func parseChatCommand(s *Session, command string) {
 									})
 									if ei != -1 {
 										delta = uint32(-1 * math.Pow(2, float64(course.ID)))
-										sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandCourseDisabled"], course.Aliases()[0]))
+										sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.course.disabled, course.Aliases()[0]))
 									}
 								} else {
 									delta = uint32(math.Pow(2, float64(course.ID)))
-									sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandCourseEnabled"], course.Aliases()[0]))
+									sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.course.enabled, course.Aliases()[0]))
 								}
-								err = s.server.db.QueryRow("SELECT rights FROM users u INNER JOIN characters c ON u.id = c.user_id WHERE c.id = $1", s.charID).Scan(&rightsInt)
+								err := s.server.db.QueryRow("SELECT rights FROM users u INNER JOIN characters c ON u.id = c.user_id WHERE c.id = $1", s.charID).Scan(&rightsInt)
 								if err == nil {
 									s.server.db.Exec("UPDATE users u SET rights=$1 WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$2)", rightsInt+delta, s.charID)
 								}
 								updateRights(s)
 							} else {
-								sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandCourseLocked"], course.Aliases()[0]))
+								sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.course.locked, course.Aliases()[0]))
 							}
 							return
 						}
 					}
 				}
-				sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandCourseError"], commands["Course"].Prefix))
+			} else {
+				sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.course.error, commands["Course"].Prefix))
 			}
 		} else {
 			sendDisabledCommandMessage(s, commands["Course"])
 		}
-	}
-
-	if strings.HasPrefix(command, commands["Raviente"].Prefix) {
-		if commands["Raviente"].Enabled {
-			if getRaviSemaphore(s.server) != nil {
-				s.server.raviente.Lock()
-				if !strings.HasPrefix(command, "!ravi ") {
-					sendServerChatMessage(s, s.server.dict["commandRaviNoCommand"])
-				} else {
-					if strings.HasPrefix(command, "!ravi start") {
-						if s.server.raviente.register.startTime == 0 {
-							s.server.raviente.register.startTime = s.server.raviente.register.postTime
-							sendServerChatMessage(s, s.server.dict["commandRaviStartSuccess"])
+	case commands["Raviente"].Prefix:
+		if commands["Raviente"].Enabled || s.isOp() {
+			if len(args) > 1 {
+				if s.server.getRaviSemaphore() != nil {
+					switch args[1] {
+					case "start":
+						if s.server.raviente.register[1] == 0 {
+							s.server.raviente.register[1] = s.server.raviente.register[3]
+							sendServerChatMessage(s, s.server.i18n.commands.ravi.start.success)
 							s.notifyRavi()
 						} else {
-							sendServerChatMessage(s, s.server.dict["commandRaviStartError"])
+							sendServerChatMessage(s, s.server.i18n.commands.ravi.start.error)
 						}
-					} else if strings.HasPrefix(command, "!ravi cm") || strings.HasPrefix(command, "!ravi checkmultiplier") {
-						sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandRaviMultiplier"], s.server.raviente.GetRaviMultiplier(s.server)))
-					} else if strings.HasPrefix(command, "!ravi sr") || strings.HasPrefix(command, "!ravi sendres") {
-						if s.server.raviente.state.stateData[28] > 0 {
-							sendServerChatMessage(s, s.server.dict["commandRaviResSuccess"])
-							s.server.raviente.state.stateData[28] = 0
+					case "cm", "check", "checkmultiplier", "multiplier":
+						sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.ravi.multiplier, s.server.GetRaviMultiplier()))
+					case "sr", "sendres", "resurrection", "ss", "sendsed", "rs", "reqsed":
+						if s.server.erupeConfig.RealClientMode == _config.ZZ {
+							switch args[1] {
+							case "sr", "sendres", "resurrection":
+								if s.server.raviente.state[28] > 0 {
+									sendServerChatMessage(s, s.server.i18n.commands.ravi.res.success)
+									s.server.raviente.state[28] = 0
+								} else {
+									sendServerChatMessage(s, s.server.i18n.commands.ravi.res.error)
+								}
+							case "ss", "sendsed":
+								sendServerChatMessage(s, s.server.i18n.commands.ravi.sed.success)
+								// Total BerRavi HP
+								HP := s.server.raviente.state[0] + s.server.raviente.state[1] + s.server.raviente.state[2] + s.server.raviente.state[3] + s.server.raviente.state[4]
+								s.server.raviente.support[1] = HP
+							case "rs", "reqsed":
+								sendServerChatMessage(s, s.server.i18n.commands.ravi.request)
+								// Total BerRavi HP
+								HP := s.server.raviente.state[0] + s.server.raviente.state[1] + s.server.raviente.state[2] + s.server.raviente.state[3] + s.server.raviente.state[4]
+								s.server.raviente.support[1] = HP + 1
+							}
 						} else {
-							sendServerChatMessage(s, s.server.dict["commandRaviResError"])
+							sendServerChatMessage(s, s.server.i18n.commands.ravi.version)
 						}
-					} else if strings.HasPrefix(command, "!ravi ss") || strings.HasPrefix(command, "!ravi sendsed") {
-						sendServerChatMessage(s, s.server.dict["commandRaviSedSuccess"])
-						// Total BerRavi HP
-						HP := s.server.raviente.state.stateData[0] + s.server.raviente.state.stateData[1] + s.server.raviente.state.stateData[2] + s.server.raviente.state.stateData[3] + s.server.raviente.state.stateData[4]
-						s.server.raviente.support.supportData[1] = HP
-					} else if strings.HasPrefix(command, "!ravi rs") || strings.HasPrefix(command, "!ravi reqsed") {
-						sendServerChatMessage(s, s.server.dict["commandRaviRequest"])
-						// Total BerRavi HP
-						HP := s.server.raviente.state.stateData[0] + s.server.raviente.state.stateData[1] + s.server.raviente.state.stateData[2] + s.server.raviente.state.stateData[3] + s.server.raviente.state.stateData[4]
-						s.server.raviente.support.supportData[1] = HP + 12
-					} else {
-						sendServerChatMessage(s, s.server.dict["commandRaviError"])
+					default:
+						sendServerChatMessage(s, s.server.i18n.commands.ravi.error)
 					}
+				} else {
+					sendServerChatMessage(s, s.server.i18n.commands.ravi.noPlayers)
 				}
-				s.server.raviente.Unlock()
 			} else {
-				sendServerChatMessage(s, s.server.dict["commandRaviNoPlayers"])
+				sendServerChatMessage(s, s.server.i18n.commands.ravi.error)
 			}
 		} else {
 			sendDisabledCommandMessage(s, commands["Raviente"])
 		}
-	}
-
-	if strings.HasPrefix(command, commands["Teleport"].Prefix) {
-		if commands["Teleport"].Enabled {
-			var x, y int16
-			n, err := fmt.Sscanf(command, fmt.Sprintf("%s %%d %%d", commands["Teleport"].Prefix), &x, &y)
-			if err != nil || n != 2 {
-				sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandTeleportError"], commands["Teleport"].Prefix))
-			} else {
-				sendServerChatMessage(s, fmt.Sprintf(s.server.dict["commandTeleportSuccess"], x, y))
-
-				// Make the inside of the casted binary
+	case commands["Teleport"].Prefix:
+		if commands["Teleport"].Enabled || s.isOp() {
+			if len(args) > 2 {
+				x, _ := strconv.ParseInt(args[1], 10, 16)
+				y, _ := strconv.ParseInt(args[2], 10, 16)
 				payload := byteframe.NewByteFrame()
 				payload.SetLE()
-				payload.WriteUint8(2) // SetState type(position == 2)
-				payload.WriteInt16(x) // X
-				payload.WriteInt16(y) // Y
+				payload.WriteUint8(2)        // SetState type(position == 2)
+				payload.WriteInt16(int16(x)) // X
+				payload.WriteInt16(int16(y)) // Y
 				payloadBytes := payload.Data()
-
 				s.QueueSendMHF(&mhfpacket.MsgSysCastedBinary{
 					CharID:         s.charID,
 					MessageType:    BinaryMessageTypeState,
 					RawDataPayload: payloadBytes,
 				})
+				sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.teleport.success, x, y))
+			} else {
+				sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.teleport.error, commands["Teleport"].Prefix))
 			}
 		} else {
 			sendDisabledCommandMessage(s, commands["Teleport"])
+		}
+	case commands["Discord"].Prefix:
+		if commands["Discord"].Enabled || s.isOp() {
+			var _token string
+			err := s.server.db.QueryRow(`SELECT discord_token FROM users u WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$1)`, s.charID).Scan(&_token)
+			if err != nil {
+				randToken := make([]byte, 4)
+				rand.Read(randToken)
+				_token = fmt.Sprintf("%x-%x", randToken[:2], randToken[2:])
+				s.server.db.Exec(`UPDATE users u SET discord_token = $1 WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$2)`, _token, s.charID)
+			}
+			sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.commands.discord.success, _token))
+		} else {
+			sendDisabledCommandMessage(s, commands["Discord"])
+		}
+	case commands["Help"].Prefix:
+		if commands["Help"].Enabled || s.isOp() {
+			for _, command := range commands {
+				if command.Enabled || s.isOp() {
+					sendServerChatMessage(s, fmt.Sprintf("%s%s: %s", s.server.erupeConfig.CommandPrefix, command.Prefix, command.Description))
+				}
+			}
+		} else {
+			sendDisabledCommandMessage(s, commands["Help"])
 		}
 	}
 }
@@ -331,14 +426,18 @@ func handleMsgSysCastBinary(s *Session, p mhfpacket.MHFPacket) {
 
 	if pkt.BroadcastType == 0x03 && pkt.MessageType == 0x03 && len(pkt.RawDataPayload) == 0x10 {
 		if tmp.ReadUint16() == 0x0002 && tmp.ReadUint8() == 0x18 {
-			_ = tmp.ReadBytes(9)
-			tmp.SetLE()
-			frame := tmp.ReadUint32()
-			sendServerChatMessage(s, fmt.Sprintf("TIME : %d'%d.%03d (%dframe)", frame/30/60, frame/30%60, int(math.Round(float64(frame%30*100)/3)), frame))
+			var timer bool
+			s.server.db.QueryRow(`SELECT COALESCE(timer, false) FROM users u WHERE u.id=(SELECT c.user_id FROM characters c WHERE c.id=$1)`, s.charID).Scan(&timer)
+			if timer {
+				_ = tmp.ReadBytes(9)
+				tmp.SetLE()
+				frame := tmp.ReadUint32()
+				sendServerChatMessage(s, fmt.Sprintf(s.server.i18n.timer, frame/30/60/60, frame/30/60, frame/30%60, int(math.Round(float64(frame%30*100)/3)), frame))
+			}
 		}
 	}
 
-	if s.server.erupeConfig.DevModeOptions.QuestDebugTools == true && s.server.erupeConfig.DevMode {
+	if s.server.erupeConfig.DebugOptions.QuestTools {
 		if pkt.BroadcastType == 0x03 && pkt.MessageType == 0x02 && len(pkt.RawDataPayload) > 32 {
 			// This is only correct most of the time
 			tmp.ReadBytes(20)
@@ -352,24 +451,20 @@ func handleMsgSysCastBinary(s *Session, p mhfpacket.MHFPacket) {
 
 	// Parse out the real casted binary payload
 	var msgBinTargeted *binpacket.MsgBinTargeted
-	var authorLen, msgLen uint16
-	var msg []byte
-
-	isDiceCommand := false
+	var message, author string
+	var returnToSender bool
 	if pkt.MessageType == BinaryMessageTypeChat {
 		tmp.SetLE()
-		tmp.Seek(int64(0), 0)
-		_ = tmp.ReadUint32()
-		authorLen = tmp.ReadUint16()
-		msgLen = tmp.ReadUint16()
-		msg = tmp.ReadNullTerminatedBytes()
+		tmp.Seek(8, 0)
+		message = string(tmp.ReadNullTerminatedBytes())
+		author = string(tmp.ReadNullTerminatedBytes())
 	}
 
 	// Customise payload
 	realPayload := pkt.RawDataPayload
 	if pkt.BroadcastType == BroadcastTypeTargeted {
 		tmp.SetBE()
-		tmp.Seek(int64(0), 0)
+		tmp.Seek(0, 0)
 		msgBinTargeted = &binpacket.MsgBinTargeted{}
 		err := msgBinTargeted.Parse(tmp)
 		if err != nil {
@@ -378,24 +473,24 @@ func handleMsgSysCastBinary(s *Session, p mhfpacket.MHFPacket) {
 		}
 		realPayload = msgBinTargeted.RawDataPayload
 	} else if pkt.MessageType == BinaryMessageTypeChat {
-		if msgLen == 6 && string(msg) == "@dice" {
-			isDiceCommand = true
-			roll := byteframe.NewByteFrame()
-			roll.WriteInt16(1) // Unk
-			roll.SetLE()
-			roll.WriteUint16(4) // Unk
-			roll.WriteUint16(authorLen)
-			dice := fmt.Sprintf("%d", token.RNG().Intn(100)+1)
-			roll.WriteUint16(uint16(len(dice) + 1))
-			roll.WriteNullTerminatedBytes([]byte(dice))
-			roll.WriteNullTerminatedBytes(tmp.ReadNullTerminatedBytes())
-			realPayload = roll.Data()
+		if message == "@dice" {
+			returnToSender = true
+			m := binpacket.MsgBinChat{
+				Type:       BinaryMessageTypeChat,
+				Flags:      4,
+				Message:    fmt.Sprintf(`%d`, token.RNG.Intn(100)+1),
+				SenderName: author,
+			}
+			bf := byteframe.NewByteFrame()
+			bf.SetLE()
+			m.Build(bf)
+			realPayload = bf.Data()
 		} else {
 			bf := byteframe.NewByteFrameFromBytes(pkt.RawDataPayload)
 			bf.SetLE()
 			chatMessage := &binpacket.MsgBinChat{}
 			chatMessage.Parse(bf)
-			if strings.HasPrefix(chatMessage.Message, "!") {
+			if strings.HasPrefix(chatMessage.Message, s.server.erupeConfig.CommandPrefix) {
 				parseChatCommand(s, chatMessage.Message)
 				return
 			}
@@ -418,15 +513,16 @@ func handleMsgSysCastBinary(s *Session, p mhfpacket.MHFPacket) {
 	case BroadcastTypeWorld:
 		s.server.WorldcastMHF(resp, s, nil)
 	case BroadcastTypeStage:
-		if isDiceCommand {
-			s.stage.BroadcastMHF(resp, nil) // send dice result back to caller
+		if returnToSender {
+			s.stage.BroadcastMHF(resp, nil)
 		} else {
 			s.stage.BroadcastMHF(resp, s)
 		}
 	case BroadcastTypeServer:
 		if pkt.MessageType == 1 {
-			if getRaviSemaphore(s.server) != nil {
-				s.server.BroadcastMHF(resp, s)
+			raviSema := s.server.getRaviSemaphore()
+			if raviSema != nil {
+				raviSema.BroadcastMHF(resp, s)
 			}
 		} else {
 			s.server.BroadcastMHF(resp, s)

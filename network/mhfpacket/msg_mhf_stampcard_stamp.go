@@ -2,6 +2,7 @@ package mhfpacket
 
 import (
 	"errors"
+	_config "erupe-ce/config"
 
 	"erupe-ce/common/byteframe"
 	"erupe-ce/network"
@@ -33,13 +34,15 @@ func (m *MsgMhfStampcardStamp) Parse(bf *byteframe.ByteFrame, ctx *clientctx.Cli
 	m.HR = bf.ReadUint16()
 	m.GR = bf.ReadUint16()
 	m.Stamps = bf.ReadUint16()
-	_ = bf.ReadUint16()
-	m.Reward1 = uint16(bf.ReadUint32())
-	m.Reward2 = uint16(bf.ReadUint32())
-	m.Item1 = uint16(bf.ReadUint32())
-	m.Item2 = uint16(bf.ReadUint32())
-	m.Quantity1 = uint16(bf.ReadUint32())
-	m.Quantity2 = uint16(bf.ReadUint32())
+	bf.ReadUint16() // Zeroed
+	if _config.ErupeConfig.RealClientMode > _config.Z1 {
+		m.Reward1 = uint16(bf.ReadUint32())
+		m.Reward2 = uint16(bf.ReadUint32())
+		m.Item1 = uint16(bf.ReadUint32())
+		m.Item2 = uint16(bf.ReadUint32())
+		m.Quantity1 = uint16(bf.ReadUint32())
+		m.Quantity2 = uint16(bf.ReadUint32())
+	}
 	return nil
 }
 

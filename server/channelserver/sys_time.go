@@ -16,10 +16,17 @@ func TimeMidnight() time.Time {
 
 func TimeWeekStart() time.Time {
 	midnight := TimeMidnight()
-	offset := (int(midnight.Weekday()) - 1) * -24
-	return midnight.Add(time.Hour * time.Duration(offset))
+	offset := int(midnight.Weekday()) - int(time.Monday)
+	if offset < 0 {
+		offset += 7
+	}
+	return midnight.Add(-time.Duration(offset) * 24 * time.Hour)
 }
 
 func TimeWeekNext() time.Time {
 	return TimeWeekStart().Add(time.Hour * 24 * 7)
+}
+
+func TimeGameAbsolute() uint32 {
+	return uint32((TimeAdjusted().Unix() - 2160) % 5760)
 }

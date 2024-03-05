@@ -18,14 +18,14 @@ import (
 type Config struct {
 	Logger      *zap.Logger
 	DB          *sqlx.DB
-	ErupeConfig *config.Config
+	ErupeConfig *_config.Config
 }
 
 // Server is the MHF custom launcher sign server.
 type Server struct {
 	sync.Mutex
 	logger         *zap.Logger
-	erupeConfig    *config.Config
+	erupeConfig    *_config.Config
 	db             *sqlx.DB
 	httpServer     *http.Server
 	isShuttingDown bool
@@ -51,6 +51,7 @@ func (s *Server) Start() error {
 	r.HandleFunc("/register", s.Register)
 	r.HandleFunc("/character/create", s.CreateCharacter)
 	r.HandleFunc("/character/delete", s.DeleteCharacter)
+	r.HandleFunc("/character/export", s.ExportSave)
 	handler := handlers.CORS(handlers.AllowedHeaders([]string{"Content-Type"}))(r)
 	s.httpServer.Handler = handlers.LoggingHandler(os.Stdout, handler)
 	s.httpServer.Addr = fmt.Sprintf(":%d", s.erupeConfig.SignV2.Port)

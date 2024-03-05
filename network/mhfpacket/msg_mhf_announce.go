@@ -14,7 +14,7 @@ type MsgMhfAnnounce struct {
 	IPAddress uint32
 	Port      uint16
 	StageID   []byte
-	Type      uint8
+	Data      *byteframe.ByteFrame
 }
 
 // Opcode returns the ID associated with this packet type.
@@ -28,10 +28,10 @@ func (m *MsgMhfAnnounce) Parse(bf *byteframe.ByteFrame, ctx *clientctx.ClientCon
 	m.IPAddress = bf.ReadUint32()
 	m.Port = bf.ReadUint16()
 	_ = bf.ReadUint8()
-	_ = bf.ReadUint16()
+	_ = bf.ReadUint8()
+	_ = bf.ReadUint8()
 	m.StageID = bf.ReadBytes(32)
-	_ = bf.ReadUint32()
-	m.Type = bf.ReadUint8()
+	m.Data = byteframe.NewByteFrameFromBytes(bf.ReadBytes(uint(bf.ReadUint32())))
 	return nil
 }
 

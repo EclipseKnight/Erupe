@@ -162,8 +162,7 @@ func handleMsgMhfOperateJoint(s *Session, p mhfpacket.MHFPacket) {
 		}
 	case mhfpacket.OPERATE_JOINT_KICK:
 		if alliance.ParentGuild.LeaderCharID == s.charID {
-			_ = pkt.UnkData.ReadUint8()
-			kickedGuildID := pkt.UnkData.ReadUint32()
+			kickedGuildID := pkt.Data1.ReadUint32()
 			if kickedGuildID == alliance.SubGuild1ID && alliance.SubGuild2ID > 0 {
 				s.server.db.Exec(`UPDATE guild_alliances SET sub1_id = sub2_id, sub2_id = NULL WHERE id = $1`, alliance.ID)
 			} else if kickedGuildID == alliance.SubGuild1ID && alliance.SubGuild2ID == 0 {
@@ -209,14 +208,14 @@ func handleMsgMhfInfoJoint(s *Session, p mhfpacket.MHFPacket) {
 		}
 		bf.WriteUint32(alliance.ParentGuildID)
 		bf.WriteUint32(alliance.ParentGuild.LeaderCharID)
-		bf.WriteUint16(alliance.ParentGuild.Rank)
+		bf.WriteUint16(alliance.ParentGuild.Rank())
 		bf.WriteUint16(alliance.ParentGuild.MemberCount)
 		ps.Uint16(bf, alliance.ParentGuild.Name, true)
 		ps.Uint16(bf, alliance.ParentGuild.LeaderName, true)
 		if alliance.SubGuild1ID > 0 {
 			bf.WriteUint32(alliance.SubGuild1ID)
 			bf.WriteUint32(alliance.SubGuild1.LeaderCharID)
-			bf.WriteUint16(alliance.SubGuild1.Rank)
+			bf.WriteUint16(alliance.SubGuild1.Rank())
 			bf.WriteUint16(alliance.SubGuild1.MemberCount)
 			ps.Uint16(bf, alliance.SubGuild1.Name, true)
 			ps.Uint16(bf, alliance.SubGuild1.LeaderName, true)
@@ -224,7 +223,7 @@ func handleMsgMhfInfoJoint(s *Session, p mhfpacket.MHFPacket) {
 		if alliance.SubGuild2ID > 0 {
 			bf.WriteUint32(alliance.SubGuild2ID)
 			bf.WriteUint32(alliance.SubGuild2.LeaderCharID)
-			bf.WriteUint16(alliance.SubGuild2.Rank)
+			bf.WriteUint16(alliance.SubGuild2.Rank())
 			bf.WriteUint16(alliance.SubGuild2.MemberCount)
 			ps.Uint16(bf, alliance.SubGuild2.Name, true)
 			ps.Uint16(bf, alliance.SubGuild2.LeaderName, true)

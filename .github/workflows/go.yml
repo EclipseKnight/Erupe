@@ -1,6 +1,15 @@
 name: Build
 
-on: [push]
+on:
+  push:
+    paths:
+      - 'common/**'
+      - 'config/**'
+      - 'network/**'
+      - 'server/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'main.go'
 
 jobs:
   build:
@@ -12,7 +21,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v3
       with:
-        go-version: 1.18
+        go-version: '1.21'
 
     - name: Build Linux-amd64
       run: env GOOS=linux GOARCH=amd64 go build -v

@@ -3,11 +3,11 @@ package network
 import (
 	"encoding/hex"
 	"errors"
+	_config "erupe-ce/config"
+	"erupe-ce/network/crypto"
 	"fmt"
 	"io"
 	"net"
-
-	"erupe-ce/network/crypto"
 )
 
 // CryptConn represents a MHF encrypted two-way connection,
@@ -48,7 +48,14 @@ func (cc *CryptConn) ReadPacket() ([]byte, error) {
 	}
 
 	// Now read the encrypted packet body after getting its size from the header.
-	encryptedPacketBody := make([]byte, cph.DataSize)
+	var encryptedPacketBody []byte
+
+	// Don't know when support for this was added, works in Forward.4, doesn't work in Season 6.0
+	if _config.ErupeConfig.RealClientMode < _config.F1 {
+		encryptedPacketBody = make([]byte, cph.DataSize)
+	} else {
+		encryptedPacketBody = make([]byte, uint32(cph.DataSize)+(uint32(cph.Pf0-0x03)*0x1000))
+	}
 	_, err = io.ReadFull(cc.conn, encryptedPacketBody)
 	if err != nil {
 		return nil, err
@@ -56,10 +63,10 @@ func (cc *CryptConn) ReadPacket() ([]byte, error) {
 
 	// Update the key rotation before decrypting.
 	if cph.KeyRotDelta != 0 {
-		cc.readKeyRot = (uint32(cph.KeyRotDelta) * (cc.readKeyRot + 1))
+		cc.readKeyRot = uint32(cph.KeyRotDelta) * (cc.readKeyRot + 1)
 	}
 
-	out, combinedCheck, check0, check1, check2 := crypto.Decrypt(encryptedPacketBody, cc.readKeyRot, nil)
+	out, combinedCheck, check0, check1, check2 := crypto.Crypto(encryptedPacketBody, cc.readKeyRot, false, nil)
 	if cph.Check0 != check0 || cph.Check1 != check1 || cph.Check2 != check2 {
 		fmt.Printf("got c0 %X, c1 %X, c2 %X\n", check0, check1, check2)
 		fmt.Printf("want c0 %X, c1 %X, c2 %X\n", cph.Check0, cph.Check1, cph.Check2)
@@ -69,7 +76,7 @@ func (cc *CryptConn) ReadPacket() ([]byte, error) {
 		// Attempt to bruteforce it.
 		fmt.Println("Crypto out of sync? Attempting bruteforce")
 		for key := byte(0); key < 255; key++ {
-			out, combinedCheck, check0, check1, check2 = crypto.Decrypt(encryptedPacketBody, 0, &key)
+			out, combinedCheck, check0, check1, check2 = crypto.Crypto(encryptedPacketBody, 0, false, &key)
 			//fmt.Printf("Key: 0x%X\n%s\n", key, hex.Dump(out))
 			if cph.Check0 == check0 && cph.Check1 == check1 && cph.Check2 == check2 {
 				fmt.Printf("Bruceforce successful, override key: 0x%X\n", key)
@@ -94,11 +101,11 @@ func (cc *CryptConn) SendPacket(data []byte) error {
 	keyRotDelta := byte(3)
 
 	if keyRotDelta != 0 {
-		cc.sendKeyRot = (uint32(keyRotDelta) * (cc.sendKeyRot + 1))
+		cc.sendKeyRot = uint32(keyRotDelta) * (cc.sendKeyRot + 1)
 	}
 
 	// Encrypt the data
-	encData, combinedCheck, check0, check1, check2 := crypto.Encrypt(data, cc.sendKeyRot, nil)
+	encData, combinedCheck, check0, check1, check2 := crypto.Crypto(data, cc.sendKeyRot, true, nil)
 
 	header := &CryptPacketHeader{}
 	header.Pf0 = byte(((uint(len(encData)) >> 12) & 0xF3) | 3)
@@ -115,9 +122,7 @@ func (cc *CryptConn) SendPacket(data []byte) error {
 		return err
 	}
 
-	cc.conn.Write(headerBytes)
-	cc.conn.Write(encData)
-
+	cc.conn.Write(append(headerBytes, encData...))
 	cc.sentPackets++
 	cc.prevSendPacketCombinedCheck = combinedCheck
 

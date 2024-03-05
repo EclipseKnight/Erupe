@@ -2,6 +2,7 @@ package channelserver
 
 import (
 	"erupe-ce/common/token"
+	_config "erupe-ce/config"
 	"math"
 	"time"
 
@@ -9,47 +10,41 @@ import (
 	"erupe-ce/network/mhfpacket"
 )
 
-func handleMsgMhfRegisterEvent(s *Session, p mhfpacket.MHFPacket) {
-	pkt := p.(*mhfpacket.MsgMhfRegisterEvent)
-	bf := byteframe.NewByteFrame()
-	bf.WriteUint8(pkt.Unk2)
-	bf.WriteUint8(pkt.Unk4)
-	bf.WriteUint16(0x1142)
-	doAckSimpleSucceed(s, pkt.AckHandle, bf.Data())
-}
-
-func handleMsgMhfReleaseEvent(s *Session, p mhfpacket.MHFPacket) {
-	pkt := p.(*mhfpacket.MsgMhfReleaseEvent)
-
-	// Do this ack manually because it uses a non-(0|1) error code
-	/*
-		_ACK_SUCCESS = 0
-		_ACK_ERROR = 1
-
-		_ACK_EINPROGRESS = 16
-		_ACK_ENOENT = 17
-		_ACK_ENOSPC = 18
-		_ACK_ETIMEOUT = 19
-
-		_ACK_EINVALID = 64
-		_ACK_EFAILED = 65
-		_ACK_ENOMEM = 66
-		_ACK_ENOTEXIT = 67
-		_ACK_ENOTREADY = 68
-		_ACK_EALREADY = 69
-		_ACK_DISABLE_WORK = 71
-	*/
-	s.QueueSendMHF(&mhfpacket.MsgSysAck{
-		AckHandle:        pkt.AckHandle,
-		IsBufferResponse: false,
-		ErrorCode:        0x41,
-		AckData:          []byte{0x00, 0x00, 0x00, 0x00},
-	})
+type Event struct {
+	EventType    uint16
+	Unk1         uint16
+	Unk2         uint16
+	Unk3         uint16
+	Unk4         uint16
+	Unk5         uint32
+	Unk6         uint32
+	QuestFileIDs []uint16
 }
 
 func handleMsgMhfEnumerateEvent(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfEnumerateEvent)
-	stubEnumerateNoResults(s, pkt.AckHandle)
+	bf := byteframe.NewByteFrame()
+
+	events := []Event{}
+
+	bf.WriteUint8(uint8(len(events)))
+	for _, event := range events {
+		bf.WriteUint16(event.EventType)
+		bf.WriteUint16(event.Unk1)
+		bf.WriteUint16(event.Unk2)
+		bf.WriteUint16(event.Unk3)
+		bf.WriteUint16(event.Unk4)
+		bf.WriteUint32(event.Unk5)
+		bf.WriteUint32(event.Unk6)
+		if event.EventType == 2 {
+			bf.WriteUint8(uint8(len(event.QuestFileIDs)))
+			for _, qf := range event.QuestFileIDs {
+				bf.WriteUint16(qf)
+			}
+		}
+	}
+
+	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
 
 type activeFeature struct {
@@ -71,7 +66,8 @@ func handleMsgMhfGetWeeklySchedule(s *Session, p mhfpacket.MHFPacket) {
 		var temp activeFeature
 		err := s.server.db.QueryRowx(`SELECT start_time, featured FROM feature_weapon WHERE start_time=$1`, t).StructScan(&temp)
 		if err != nil || temp.StartTime.IsZero() {
-			temp = generateFeatureWeapons(s.server.erupeConfig.GameplayOptions.FeaturedWeapons)
+			weapons := token.RNG.Intn(s.server.erupeConfig.GameplayOptions.MaxFeatureWeapons-s.server.erupeConfig.GameplayOptions.MinFeatureWeapons+1) + s.server.erupeConfig.GameplayOptions.MinFeatureWeapons
+			temp = generateFeatureWeapons(weapons)
 			temp.StartTime = t
 			s.server.db.Exec(`INSERT INTO feature_weapon VALUES ($1, $2)`, temp.StartTime, temp.ActiveFeatures)
 		}
@@ -90,14 +86,23 @@ func handleMsgMhfGetWeeklySchedule(s *Session, p mhfpacket.MHFPacket) {
 }
 
 func generateFeatureWeapons(count int) activeFeature {
-	if count > 14 {
-		count = 14
+	_max := 14
+	if _config.ErupeConfig.RealClientMode < _config.ZZ {
+		_max = 13
+	}
+	if _config.ErupeConfig.RealClientMode < _config.G10 {
+		_max = 12
+	}
+	if _config.ErupeConfig.RealClientMode < _config.GG {
+		_max = 11
+	}
+	if count > _max {
+		count = _max
 	}
 	nums := make([]int, 0)
 	var result int
 	for len(nums) < count {
-		rng := token.RNG()
-		num := rng.Intn(14)
+		num := token.RNG.Intn(_max)
 		exist := false
 		for _, v := range nums {
 			if v == num {
@@ -194,15 +199,11 @@ func handleMsgMhfUseKeepLoginBoost(s *Session, p mhfpacket.MHFPacket) {
 	bf := byteframe.NewByteFrame()
 	bf.WriteUint8(0)
 	switch pkt.BoostWeekUsed {
-	case 1:
-		fallthrough
-	case 3:
+	case 1, 3:
 		expiration = TimeAdjusted().Add(120 * time.Minute)
 	case 4:
 		expiration = TimeAdjusted().Add(180 * time.Minute)
-	case 2:
-		fallthrough
-	case 5:
+	case 2, 5:
 		expiration = TimeAdjusted().Add(240 * time.Minute)
 	}
 	bf.WriteUint32(uint32(expiration.Unix()))

@@ -1,22 +1,98 @@
 package channelserver
 
 import (
-	"encoding/hex"
+	"database/sql"
+	"encoding/binary"
+	"erupe-ce/common/byteframe"
+	"erupe-ce/common/decryption"
+	ps "erupe-ce/common/pascalstring"
+	_config "erupe-ce/config"
+	"erupe-ce/network/mhfpacket"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
-	"erupe-ce/common/byteframe"
-	"erupe-ce/network/mhfpacket"
 	"go.uber.org/zap"
 )
+
+type tuneValue struct {
+	ID    uint16
+	Value uint16
+}
+
+func findSubSliceIndices(data []byte, sub []byte) []int {
+	var indices []int
+	lenSub := len(sub)
+	for i := 0; i < len(data); i++ {
+		if i+lenSub > len(data) {
+			break
+		}
+		if equal(data[i:i+lenSub], sub) {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+func equal(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, v := range a {
+		if v != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func BackportQuest(data []byte) []byte {
+	wp := binary.LittleEndian.Uint32(data[0:4]) + 96
+	rp := wp + 4
+	for i := uint32(0); i < 6; i++ {
+		if i != 0 {
+			wp += 4
+			rp += 8
+		}
+		copy(data[wp:wp+4], data[rp:rp+4])
+	}
+
+	fillLength := uint32(108)
+	if _config.ErupeConfig.RealClientMode <= _config.S6 {
+		fillLength = 44
+	} else if _config.ErupeConfig.RealClientMode <= _config.F5 {
+		fillLength = 52
+	} else if _config.ErupeConfig.RealClientMode <= _config.G101 {
+		fillLength = 76
+	}
+
+	copy(data[wp:wp+fillLength], data[rp:rp+fillLength])
+	if _config.ErupeConfig.RealClientMode <= _config.G91 {
+		patterns := [][]byte{
+			{0x0A, 0x00, 0x01, 0x33, 0xD7, 0x00}, // 10% Armor Sphere -> Stone
+			{0x06, 0x00, 0x02, 0x33, 0xD8, 0x00}, // 6% Armor Sphere+ -> Iron Ore
+			{0x0A, 0x00, 0x03, 0x33, 0xD7, 0x00}, // 10% Adv Armor Sphere -> Stone
+			{0x06, 0x00, 0x04, 0x33, 0xDB, 0x00}, // 6% Hard Armor Sphere -> Dragonite Ore
+			{0x0A, 0x00, 0x05, 0x33, 0xD9, 0x00}, // 10% Heaven Armor Sphere -> Earth Crystal
+			{0x06, 0x00, 0x06, 0x33, 0xDB, 0x00}, // 6% True Armor Sphere -> Dragonite Ore
+		}
+		for i := range patterns {
+			j := findSubSliceIndices(data, patterns[i][0:4])
+			for k := range j {
+				copy(data[j[k]+2:j[k]+4], patterns[i][4:6])
+			}
+		}
+	}
+	return data
+}
 
 func handleMsgSysGetFile(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgSysGetFile)
 
 	if pkt.IsScenario {
-		if s.server.erupeConfig.DevModeOptions.QuestDebugTools && s.server.erupeConfig.DevMode {
+		if s.server.erupeConfig.DebugOptions.QuestTools {
 			s.logger.Debug(
 				"Scenario",
 				zap.Uint8("CategoryID", pkt.ScenarioIdentifer.CategoryID),
@@ -36,29 +112,55 @@ func handleMsgSysGetFile(s *Session, p mhfpacket.MHFPacket) {
 		}
 		doAckBufSucceed(s, pkt.AckHandle, data)
 	} else {
-		if _, err := os.Stat(filepath.Join(s.server.erupeConfig.BinPath, "quest_override.bin")); err == nil {
-			data, err := os.ReadFile(filepath.Join(s.server.erupeConfig.BinPath, "quest_override.bin"))
-			if err != nil {
-				panic(err)
-			}
-			doAckBufSucceed(s, pkt.AckHandle, data)
-		} else {
-			if s.server.erupeConfig.DevModeOptions.QuestDebugTools && s.server.erupeConfig.DevMode {
-				s.logger.Debug(
-					"Quest",
-					zap.String("Filename", pkt.Filename),
-				)
-			}
-			// Get quest file.
-			data, err := os.ReadFile(filepath.Join(s.server.erupeConfig.BinPath, fmt.Sprintf("quests/%s.bin", pkt.Filename)))
-			if err != nil {
-				s.logger.Error(fmt.Sprintf("Failed to open file: %s/quests/%s.bin", s.server.erupeConfig.BinPath, pkt.Filename))
-				// This will crash the game.
-				doAckBufSucceed(s, pkt.AckHandle, data)
-				return
-			}
-			doAckBufSucceed(s, pkt.AckHandle, data)
+		if s.server.erupeConfig.DebugOptions.QuestTools {
+			s.logger.Debug(
+				"Quest",
+				zap.String("Filename", pkt.Filename),
+			)
 		}
+
+		if s.server.erupeConfig.GameplayOptions.SeasonOverride {
+			pkt.Filename = seasonConversion(s, pkt.Filename)
+		}
+
+		data, err := os.ReadFile(filepath.Join(s.server.erupeConfig.BinPath, fmt.Sprintf("quests/%s.bin", pkt.Filename)))
+		if err != nil {
+			s.logger.Error(fmt.Sprintf("Failed to open file: %s/quests/%s.bin", s.server.erupeConfig.BinPath, pkt.Filename))
+			// This will crash the game.
+			doAckBufSucceed(s, pkt.AckHandle, data)
+			return
+		}
+		if _config.ErupeConfig.RealClientMode <= _config.Z1 && s.server.erupeConfig.DebugOptions.AutoQuestBackport {
+			data = BackportQuest(decryption.UnpackSimple(data))
+		}
+		doAckBufSucceed(s, pkt.AckHandle, data)
+	}
+}
+
+func seasonConversion(s *Session, questFile string) string {
+	filename := fmt.Sprintf("%s%d", questFile[:6], s.server.Season())
+
+	// Return the seasonal file
+	if _, err := os.Stat(filepath.Join(s.server.erupeConfig.BinPath, fmt.Sprintf("quests/%s.bin", filename))); err == nil {
+		return filename
+	} else {
+		// Attempt to return the requested quest file if the seasonal file doesn't exist
+		if _, err = os.Stat(filepath.Join(s.server.erupeConfig.BinPath, fmt.Sprintf("quests/%s.bin", questFile))); err == nil {
+			return questFile
+		}
+
+		// If the code reaches this point, it's most likely a custom quest with no seasonal variations in the files.
+		// Since event quests when seasonal pick day or night and the client requests either one, we need to differentiate between the two to prevent issues.
+		var _time string
+
+		if TimeGameAbsolute() > 2880 {
+			_time = "d"
+		} else {
+			_time = "n"
+		}
+
+		// Request a d0 or n0 file depending on the time of day. The time of day matters and issues will occur if it's different to the one it requests.
+		return fmt.Sprintf("%s%s%d", questFile[:5], _time, 0)
 	}
 }
 
@@ -80,37 +182,434 @@ func handleMsgMhfSaveFavoriteQuest(s *Session, p mhfpacket.MHFPacket) {
 	doAckSimpleSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x00})
 }
 
+func loadQuestFile(s *Session, questId int) []byte {
+	data, exists := s.server.questCacheData[questId]
+	if exists && s.server.questCacheTime[questId].Add(time.Duration(s.server.erupeConfig.QuestCacheExpiry)*time.Second).After(time.Now()) {
+		return data
+	}
+
+	file, err := os.ReadFile(filepath.Join(s.server.erupeConfig.BinPath, fmt.Sprintf("quests/%05dd0.bin", questId)))
+	if err != nil {
+		return nil
+	}
+
+	decrypted := decryption.UnpackSimple(file)
+	if _config.ErupeConfig.RealClientMode <= _config.Z1 && s.server.erupeConfig.DebugOptions.AutoQuestBackport {
+		decrypted = BackportQuest(decrypted)
+	}
+	fileBytes := byteframe.NewByteFrameFromBytes(decrypted)
+	fileBytes.SetLE()
+	fileBytes.Seek(int64(fileBytes.ReadUint32()), 0)
+
+	bodyLength := 320
+	if _config.ErupeConfig.RealClientMode <= _config.S6 {
+		bodyLength = 160
+	} else if _config.ErupeConfig.RealClientMode <= _config.F5 {
+		bodyLength = 168
+	} else if _config.ErupeConfig.RealClientMode <= _config.G101 {
+		bodyLength = 192
+	} else if _config.ErupeConfig.RealClientMode <= _config.Z1 {
+		bodyLength = 224
+	}
+
+	// The n bytes directly following the data pointer must go directly into the event's body, after the header and before the string pointers.
+	questBody := byteframe.NewByteFrameFromBytes(fileBytes.ReadBytes(uint(bodyLength)))
+	questBody.SetLE()
+	// Find the master quest string pointer
+	questBody.Seek(40, 0)
+	fileBytes.Seek(int64(questBody.ReadUint32()), 0)
+	questBody.Seek(40, 0)
+	// Overwrite it
+	questBody.WriteUint32(uint32(bodyLength))
+	questBody.Seek(0, 2)
+
+	// Rewrite the quest strings and their pointers
+	var tempString []byte
+	newStrings := byteframe.NewByteFrame()
+	tempPointer := bodyLength + 32
+	for i := 0; i < 8; i++ {
+		questBody.WriteUint32(uint32(tempPointer))
+		temp := int64(fileBytes.Index())
+		fileBytes.Seek(int64(fileBytes.ReadUint32()), 0)
+		tempString = fileBytes.ReadNullTerminatedBytes()
+		fileBytes.Seek(temp+4, 0)
+		tempPointer += len(tempString) + 1
+		newStrings.WriteNullTerminatedBytes(tempString)
+	}
+	questBody.WriteBytes(newStrings.Data())
+
+	s.server.questCacheData[questId] = questBody.Data()
+	s.server.questCacheTime[questId] = time.Now()
+	return questBody.Data()
+}
+
+func makeEventQuest(s *Session, rows *sql.Rows) ([]byte, error) {
+	var id, mark uint32
+	var questId, activeDuration, inactiveDuration, flags int
+	var maxPlayers, questType uint8
+	var startTime time.Time
+	rows.Scan(&id, &maxPlayers, &questType, &questId, &mark, &flags, &startTime, &activeDuration, &inactiveDuration)
+
+	data := loadQuestFile(s, questId)
+	if data == nil {
+		return nil, fmt.Errorf(fmt.Sprintf("failed to load quest file (%d)", questId))
+	}
+
+	bf := byteframe.NewByteFrame()
+	bf.WriteUint32(id)
+	bf.WriteUint32(0) // Unk
+	bf.WriteUint8(0)  // Unk
+	switch questType {
+	case 16:
+		bf.WriteUint8(s.server.erupeConfig.GameplayOptions.RegularRavienteMaxPlayers)
+	case 22:
+		bf.WriteUint8(s.server.erupeConfig.GameplayOptions.ViolentRavienteMaxPlayers)
+	case 40:
+		bf.WriteUint8(s.server.erupeConfig.GameplayOptions.BerserkRavienteMaxPlayers)
+	case 50:
+		bf.WriteUint8(s.server.erupeConfig.GameplayOptions.ExtremeRavienteMaxPlayers)
+	case 51:
+		bf.WriteUint8(s.server.erupeConfig.GameplayOptions.SmallBerserkRavienteMaxPlayers)
+	default:
+		bf.WriteUint8(maxPlayers)
+	}
+	bf.WriteUint8(questType)
+	if questType == 9 {
+		bf.WriteBool(false)
+	} else {
+		bf.WriteBool(true)
+	}
+	bf.WriteUint16(0) // Unk
+	if _config.ErupeConfig.RealClientMode >= _config.G1 {
+		bf.WriteUint32(mark)
+	}
+	bf.WriteUint16(0) // Unk
+	bf.WriteUint16(uint16(len(data)))
+	bf.WriteBytes(data)
+
+	// Time Flag Replacement
+	// Bitset Structure: b8 UNK, b7 Required Objective, b6 UNK, b5 Night, b4 Day, b3 Cold, b2 Warm, b1 Spring
+	// if the byte is set to 0 the game choses the quest file corresponding to whatever season the game is on
+	bf.Seek(25, 0)
+	flagByte := bf.ReadUint8()
+	bf.Seek(25, 0)
+	if s.server.erupeConfig.GameplayOptions.SeasonOverride {
+		bf.WriteUint8(flagByte & 0b11100000)
+	} else {
+		// Allow for seasons to be specified in database, otherwise use the one in the file.
+		if flags < 0 {
+			bf.WriteUint8(flagByte)
+		} else {
+			bf.WriteUint8(uint8(flags))
+		}
+	}
+
+	// Bitset Structure Quest Variant 1: b8 UL Fixed, b7 UNK, b6 UNK, b5 UNK, b4 G Rank, b3 HC to UL, b2 Fix HC, b1 Hiden
+	// Bitset Structure Quest Variant 2: b8 Road, b7 High Conquest, b6 Fixed Difficulty, b5 No Active Feature, b4 Timer, b3 No Cuff, b2 No Halk Pots, b1 Low Conquest
+	// Bitset Structure Quest Variant 3: b8 No Sigils, b7 UNK, b6 Interception, b5 Zenith, b4 No GP Skills, b3 No Simple Mode?, b2 GSR to GR, b1 No Reward Skills
+
+	bf.Seek(175, 0)
+	questVariant3 := bf.ReadUint8()
+	questVariant3 &= 0b11011111 // disable Interception flag
+	bf.Seek(175, 0)
+	bf.WriteUint8(questVariant3)
+
+	bf.Seek(0, 2)
+	ps.Uint8(bf, "", true) // Debug/Notes string for quest
+	return bf.Data(), nil
+}
+
 func handleMsgMhfEnumerateQuest(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfEnumerateQuest)
 	var totalCount, returnedCount uint16
 	bf := byteframe.NewByteFrame()
 	bf.WriteUint16(0)
-	err := filepath.Walk(fmt.Sprintf("%s/events/", s.server.erupeConfig.BinPath), func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		} else if info.IsDir() {
-			return nil
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		} else {
-			if len(data) > 850 || len(data) < 400 {
-				return nil // Could be more or less strict with size limits
+
+	rows, err := s.server.db.Query("SELECT id, COALESCE(max_players, 4) AS max_players, quest_type, quest_id, COALESCE(mark, 0) AS mark, COALESCE(flags, -1), start_time, COALESCE(active_days, 0) AS active_days, COALESCE(inactive_days, 0) AS inactive_days FROM event_quests ORDER BY quest_id")
+	if err == nil {
+		currentTime := time.Now()
+		tx, _ := s.server.db.Begin()
+
+		for rows.Next() {
+			var id, mark uint32
+			var questId, flags, activeDays, inactiveDays int
+			var maxPlayers, questType uint8
+			var startTime time.Time
+
+			err = rows.Scan(&id, &maxPlayers, &questType, &questId, &mark, &flags, &startTime, &activeDays, &inactiveDays)
+			if err != nil {
+				s.logger.Error("Failed to scan event quest row", zap.Error(err))
+				continue
+			}
+
+			// Use the Event Cycling system
+			if activeDays > 0 {
+				cycleLength := (time.Duration(activeDays) + time.Duration(inactiveDays)) * 24 * time.Hour
+
+				// Count the number of full cycles elapsed since the last rotation.
+				extraCycles := int(currentTime.Sub(startTime) / cycleLength)
+
+				if extraCycles > 0 {
+					// Calculate the rotation time based on start time, active duration, and inactive duration.
+					rotationTime := startTime.Add(time.Duration(activeDays+inactiveDays) * 24 * time.Hour * time.Duration(extraCycles))
+					if currentTime.After(rotationTime) {
+						// Normalize rotationTime to 12PM JST to align with the in-game events update notification.
+						newRotationTime := time.Date(rotationTime.Year(), rotationTime.Month(), rotationTime.Day(), 12, 0, 0, 0, TimeAdjusted().Location())
+
+						_, err = tx.Exec("UPDATE event_quests SET start_time = $1 WHERE id = $2", newRotationTime, id)
+						if err != nil {
+							tx.Rollback() // Rollback if an error occurs
+							break
+						}
+						startTime = newRotationTime // Set the new start time so the quest can be used/removed immediately.
+					}
+				}
+
+				// Check if the quest is currently active
+				if currentTime.Before(startTime) || currentTime.After(startTime.Add(time.Duration(activeDays)*24*time.Hour)) {
+					continue
+				}
+			}
+
+			data, err := makeEventQuest(s, rows)
+			if err != nil {
+				s.logger.Error("Failed to make event quest", zap.Error(err))
+				continue
 			} else {
-				totalCount++
-				if totalCount > pkt.Offset && len(bf.Data()) < 60000 {
-					returnedCount++
-					bf.WriteBytes(data)
-					return nil
+				if len(data) > 896 || len(data) < 352 {
+					s.logger.Error("Invalid quest data length", zap.Int("len", len(data)))
+					continue
+				} else {
+					totalCount++
+					if totalCount > pkt.Offset && len(bf.Data()) < 60000 {
+						returnedCount++
+						bf.WriteBytes(data)
+						continue
+					}
 				}
 			}
 		}
-		return nil
-	})
-	if err != nil || totalCount == 0 {
-		doAckBufSucceed(s, pkt.AckHandle, make([]byte, 18))
-		return
+
+		rows.Close()
+		tx.Commit()
+	}
+
+	tuneValues := []tuneValue{
+		{ID: 20, Value: 1},
+		{ID: 26, Value: 1},
+		{ID: 27, Value: 1},
+		{ID: 33, Value: 1},
+		{ID: 40, Value: 1},
+		{ID: 49, Value: 1},
+		{ID: 53, Value: 1},
+		{ID: 59, Value: 1},
+		{ID: 67, Value: 1},
+		{ID: 80, Value: 1},
+		{ID: 94, Value: 1},
+		{ID: 1001, Value: 100},   // get_hrp_rate
+		{ID: 1010, Value: 300},   // get_hrp_rate_netcafe
+		{ID: 1011, Value: 300},   // get_zeny_rate_netcafe
+		{ID: 1012, Value: 300},   // get_hrp_rate_ncource
+		{ID: 1013, Value: 300},   // get_zeny_rate_ncource
+		{ID: 1014, Value: 200},   // get_hrp_rate_premium
+		{ID: 1015, Value: 200},   // get_zeny_rate_premium
+		{ID: 1021, Value: 400},   // get_gcp_rate_assist
+		{ID: 1023, Value: 8},     // unused?
+		{ID: 1024, Value: 150},   // get_hrp_rate_ptbonus
+		{ID: 1025, Value: 1},     // isValid_stampcard
+		{ID: 1026, Value: 999},   // get_grank_cap
+		{ID: 1027, Value: 100},   // get_exchange_rate_festa
+		{ID: 1028, Value: 100},   // get_exchange_rate_cafe
+		{ID: 1030, Value: 8},     // get_gquest_cap
+		{ID: 1031, Value: 100},   // get_exchange_rate_guild (GCP)
+		{ID: 1032, Value: 0},     // isValid_partner
+		{ID: 1044, Value: 200},   // get_rate_tload_time_out
+		{ID: 1045, Value: 0},     // get_rate_tower_treasure_preset
+		{ID: 1046, Value: 99},    // get_hunter_life_cap
+		{ID: 1048, Value: 0},     // get_rate_tower_hint_sec
+		{ID: 1049, Value: 10},    // get_rate_tower_gem_max
+		{ID: 1050, Value: 1},     // get_rate_tower_gem_set
+		{ID: 1051, Value: 200},   // get_pallone_score_rate_premium
+		{ID: 1052, Value: 200},   // get_trp_rate_premium
+		{ID: 1063, Value: 50000}, // get_nboost_quest_point_from_hrank
+		{ID: 1064, Value: 50000}, // get_nboost_quest_point_from_srank
+		{ID: 1065, Value: 25000}, // get_nboost_quest_point_from_grank
+		{ID: 1066, Value: 25000}, // get_nboost_quest_point_from_gsrank
+		{ID: 1067, Value: 90},    // get_lobby_member_upper_for_making_room Lv1?
+		{ID: 1068, Value: 80},    // get_lobby_member_upper_for_making_room Lv2?
+		{ID: 1069, Value: 70},    // get_lobby_member_upper_for_making_room Lv3?
+		{ID: 1072, Value: 300},   // get_rate_premium_ravi_tama
+		{ID: 1073, Value: 300},   // get_rate_premium_ravi_ax_tama
+		{ID: 1074, Value: 300},   // get_rate_premium_ravi_g_tama
+		{ID: 1078, Value: 0},     // isCapped_tenrou_irai
+		{ID: 1079, Value: 1},     // get_add_tower_level_assist
+		{ID: 1080, Value: 1},     // get_tune_add_tower_level_w_assist_nboost
+
+		// get_tune_secret_book_item
+		{ID: 1081, Value: 1},
+		{ID: 1082, Value: 4},
+		{ID: 1083, Value: 2},
+		{ID: 1084, Value: 10},
+		{ID: 1085, Value: 1},
+		{ID: 1086, Value: 4},
+		{ID: 1087, Value: 2},
+		{ID: 1088, Value: 10},
+		{ID: 1089, Value: 1},
+		{ID: 1090, Value: 3},
+		{ID: 1091, Value: 2},
+		{ID: 1092, Value: 10},
+		{ID: 1093, Value: 2},
+		{ID: 1094, Value: 5},
+		{ID: 1095, Value: 2},
+		{ID: 1096, Value: 10},
+		{ID: 1097, Value: 2},
+		{ID: 1098, Value: 5},
+		{ID: 1099, Value: 2},
+		{ID: 1100, Value: 10},
+		{ID: 1101, Value: 2},
+		{ID: 1102, Value: 5},
+		{ID: 1103, Value: 2},
+		{ID: 1104, Value: 10},
+
+		{ID: 1145, Value: 200},  // get_ud_point_rate_premium
+		{ID: 1146, Value: 0},    // isTower_invisible
+		{ID: 1147, Value: 0},    // isVenom_playable
+		{ID: 1149, Value: 20},   // get_ud_break_parts_point
+		{ID: 1152, Value: 1130}, // unused?
+		{ID: 1154, Value: 0},    // isDisabled_object_season
+		{ID: 1158, Value: 1},    // isDelivery_venom_ult_quest
+		{ID: 1160, Value: 300},  // get_rate_premium_ravi_g_enhance_tama
+
+		// unknown
+		{ID: 1162, Value: 1},
+		{ID: 1163, Value: 3},
+		{ID: 1164, Value: 5},
+		{ID: 1165, Value: 1},
+		{ID: 1166, Value: 5},
+		{ID: 1167, Value: 1},
+		{ID: 1168, Value: 3},
+		{ID: 1169, Value: 3},
+		{ID: 1170, Value: 5},
+		{ID: 1171, Value: 1},
+		{ID: 1172, Value: 1},
+		{ID: 1173, Value: 1},
+		{ID: 1174, Value: 2},
+		{ID: 1175, Value: 4},
+		{ID: 1176, Value: 10},
+		{ID: 1177, Value: 4},
+		{ID: 1178, Value: 10},
+		{ID: 1179, Value: 2},
+		{ID: 1180, Value: 5},
+	}
+
+	tuneValues = append(tuneValues, tuneValue{1020, uint16(s.server.erupeConfig.GameplayOptions.GCPMultiplier * 100)})
+
+	tuneValues = append(tuneValues, tuneValue{1029, uint16(s.server.erupeConfig.GameplayOptions.GUrgentRate * 100)})
+
+	if s.server.erupeConfig.GameplayOptions.DisableHunterNavi {
+		tuneValues = append(tuneValues, tuneValue{1037, 1})
+	}
+
+	if s.server.erupeConfig.GameplayOptions.EnableKaijiEvent {
+		tuneValues = append(tuneValues, tuneValue{1106, 1})
+	}
+
+	if s.server.erupeConfig.GameplayOptions.EnableHiganjimaEvent {
+		tuneValues = append(tuneValues, tuneValue{1144, 1})
+	}
+
+	if s.server.erupeConfig.GameplayOptions.EnableNierEvent {
+		tuneValues = append(tuneValues, tuneValue{1153, 1})
+	}
+
+	if s.server.erupeConfig.GameplayOptions.DisableRoad {
+		tuneValues = append(tuneValues, tuneValue{1155, 1})
+	}
+
+	// get_hrp_rate_from_rank
+	tuneValues = append(tuneValues, getTuneValueRange(3000, uint16(s.server.erupeConfig.GameplayOptions.HRPMultiplier*100))...)
+	tuneValues = append(tuneValues, getTuneValueRange(3338, uint16(s.server.erupeConfig.GameplayOptions.HRPMultiplierNC*100))...)
+	// get_srp_rate_from_rank
+	tuneValues = append(tuneValues, getTuneValueRange(3013, uint16(s.server.erupeConfig.GameplayOptions.SRPMultiplier*100))...)
+	tuneValues = append(tuneValues, getTuneValueRange(3351, uint16(s.server.erupeConfig.GameplayOptions.SRPMultiplierNC*100))...)
+	// get_grp_rate_from_rank
+	tuneValues = append(tuneValues, getTuneValueRange(3026, uint16(s.server.erupeConfig.GameplayOptions.GRPMultiplier*100))...)
+	tuneValues = append(tuneValues, getTuneValueRange(3364, uint16(s.server.erupeConfig.GameplayOptions.GRPMultiplierNC*100))...)
+	// get_gsrp_rate_from_rank
+	tuneValues = append(tuneValues, getTuneValueRange(3039, uint16(s.server.erupeConfig.GameplayOptions.GSRPMultiplier*100))...)
+	tuneValues = append(tuneValues, getTuneValueRange(3377, uint16(s.server.erupeConfig.GameplayOptions.GSRPMultiplierNC*100))...)
+	// get_zeny_rate_from_hrank
+	tuneValues = append(tuneValues, getTuneValueRange(3052, uint16(s.server.erupeConfig.GameplayOptions.ZennyMultiplier*100))...)
+	tuneValues = append(tuneValues, getTuneValueRange(3390, uint16(s.server.erupeConfig.GameplayOptions.ZennyMultiplierNC*100))...)
+	// get_zeny_rate_from_grank
+	tuneValues = append(tuneValues, getTuneValueRange(3078, uint16(s.server.erupeConfig.GameplayOptions.GZennyMultiplier*100))...)
+	tuneValues = append(tuneValues, getTuneValueRange(3416, uint16(s.server.erupeConfig.GameplayOptions.GZennyMultiplierNC*100))...)
+	// get_reward_rate_from_hrank
+	tuneValues = append(tuneValues, getTuneValueRange(3104, uint16(s.server.erupeConfig.GameplayOptions.MaterialMultiplier*100))...)
+	tuneValues = append(tuneValues, getTuneValueRange(3442, uint16(s.server.erupeConfig.GameplayOptions.MaterialMultiplierNC*100))...)
+	// get_reward_rate_from_grank
+	tuneValues = append(tuneValues, getTuneValueRange(3130, uint16(s.server.erupeConfig.GameplayOptions.GMaterialMultiplier*100))...)
+	tuneValues = append(tuneValues, getTuneValueRange(3468, uint16(s.server.erupeConfig.GameplayOptions.GMaterialMultiplierNC*100))...)
+	// get_lottery_rate_from_hrank
+	tuneValues = append(tuneValues, getTuneValueRange(3156, 0)...)
+	tuneValues = append(tuneValues, getTuneValueRange(3494, 0)...)
+	// get_lottery_rate_from_grank
+	tuneValues = append(tuneValues, getTuneValueRange(3182, 0)...)
+	tuneValues = append(tuneValues, getTuneValueRange(3520, 0)...)
+	// get_hagi_rate_from_hrank
+	tuneValues = append(tuneValues, getTuneValueRange(3208, s.server.erupeConfig.GameplayOptions.ExtraCarves)...)
+	tuneValues = append(tuneValues, getTuneValueRange(3546, s.server.erupeConfig.GameplayOptions.ExtraCarvesNC)...)
+	// get_hagi_rate_from_grank
+	tuneValues = append(tuneValues, getTuneValueRange(3234, s.server.erupeConfig.GameplayOptions.GExtraCarves)...)
+	tuneValues = append(tuneValues, getTuneValueRange(3572, s.server.erupeConfig.GameplayOptions.GExtraCarvesNC)...)
+	// get_nboost_transcend_rate_from_hrank
+	tuneValues = append(tuneValues, getTuneValueRange(3286, 200)...)
+	tuneValues = append(tuneValues, getTuneValueRange(3312, 300)...)
+	// get_nboost_transcend_rate_from_grank
+	tuneValues = append(tuneValues, getTuneValueRange(3299, 200)...)
+	tuneValues = append(tuneValues, getTuneValueRange(3325, 300)...)
+
+	var temp []tuneValue
+	for i := range tuneValues {
+		if tuneValues[i].Value > 0 {
+			temp = append(temp, tuneValues[i])
+		}
+	}
+	tuneValues = temp
+
+	tuneLimit := 770
+	if _config.ErupeConfig.RealClientMode <= _config.F5 {
+		tuneLimit = 256
+	} else if _config.ErupeConfig.RealClientMode <= _config.G3 {
+		tuneLimit = 283
+	} else if _config.ErupeConfig.RealClientMode <= _config.GG {
+		tuneLimit = 315
+	} else if _config.ErupeConfig.RealClientMode <= _config.G61 {
+		tuneLimit = 332
+	} else if _config.ErupeConfig.RealClientMode <= _config.G7 {
+		tuneLimit = 339
+	} else if _config.ErupeConfig.RealClientMode <= _config.G81 {
+		tuneLimit = 396
+	} else if _config.ErupeConfig.RealClientMode <= _config.G91 {
+		tuneLimit = 694
+	} else if _config.ErupeConfig.RealClientMode <= _config.G101 {
+		tuneLimit = 704
+	} else if _config.ErupeConfig.RealClientMode <= _config.Z2 {
+		tuneLimit = 750
+	}
+	if len(tuneValues) > tuneLimit {
+		tuneValues = tuneValues[:tuneLimit]
+	}
+
+	offset := uint16(time.Now().Unix())
+	bf.WriteUint16(offset)
+
+	bf.WriteUint16(uint16(len(tuneValues)))
+	for i := range tuneValues {
+		bf.WriteUint16(tuneValues[i].ID ^ offset)
+		bf.WriteUint16(offset)
+		bf.WriteBytes(make([]byte, 4))
+		bf.WriteUint16(tuneValues[i].Value ^ offset)
 	}
 
 	vsQuestItems := []uint16{1580, 1581, 1582, 1583, 1584, 1585, 1587, 1588, 1589, 1595, 1596, 1597, 1598, 1599, 1600, 1601, 1602, 1603, 1604}
@@ -123,12 +622,9 @@ func handleMsgMhfEnumerateQuest(s *Session, p mhfpacket.MHFPacket) {
 		{false, 5000},
 		{false, 10000},
 	}
-
-	data, _ := hex.DecodeString("06E601CF051406E6D4D4D40007CA02F006E6D4D4D4000685051506E6D4D4D40007CA051206E6D4D4D40007CA051306E6D4D4D40007CA02DC06E6D4D4D40006E202D806E6D4D4D40006E202A406E6D4D4D40006E5026806E6D4D4D40006E3027406E6D4D4D40006E3027006E6D4D4D40006E4026506E6D4D4D40006E602E006E6D4D4D40006EE02E706E6D4D4D40006E70B4006E6D4D4D40006E602E206E6D4D4D400068202E506E6D4D4D400068206C706E6D4D4D40006E706B606E6D4D4D40006E706D706E6D4D4D40006E706F206E6D4D4D40006E706DD06E6D4D4D40006E706D306E6D4D4D40006E706FC06E6D4D4D40006E706B806E6D4D4D40006E706CE06E6D4D4D40006E706FD06E6D4D4D40006E706A506E6D4D4D40006E7051906E6D4D4D40006EE02E606E6D4D4D40006700B4106E6D4D4D40006E60B4E06E6D4D4D40006E60B4F06E6D4D4D40006E60B4C06E6D4D4D40006E60B4D06E6D4D4D40006E60B4A06E6D4D4D40006E60B4B06E6D4D4D40006E60B4806E6D4D4D40006E60B4906E6D4D4D40006E60B5606E6D4D4D40006E60B5706E6D4D4D40006E60B5406E6D4D4D40006E60B2606E6D4D4D40006E60B2706E6D4D4D40006E602DE06E6D4D4D40006E702DF06E6D4D4D40006E70B2406E6D4D4D40006E60B2506E6D4D4D40006E60A3006E6D4D4D400062E0A3106E6D4D4D400062E0A3E06E6D4D4D400062E0B2206E6D4D4D40006E60B2306E6D4D4D40006E60B2006E6D4D4D40006E60B2106E6D4D4D40006E60B2E06E6D4D4D40006E60B2F06E6D4D4D40006E6051A06E6D4D4D4000682051B06E6D4D4D400077602CD06E6D4D4D40006BC0B2C06E6D4D4D40006E60A3F06E6D4D4D400062E0A3C06E6D4D4D400062E0A3D06E6D4D4D400062E0A3A06E6D4D4D400062E0A3B06E6D4D4D400062E0A3806E6D4D4D400062E0A3906E6D4D4D400062E0A0606E6D4D4D400062E0A0706E6D4D4D400062E0A0406E6D4D4D400062E0A0506E6D4D4D400062E0A0206E6D4D4D400062E0A0306E6D4D4D400062E0A0006E6D4D4D400062E0A0106E6D4D4D400062E0A0E06E6D4D4D400062E0A0F06E6D4D4D400062E0A0C06E6D4D4D400062E0A0D06E6D4D4D400062E0A0A06E6D4D4D400062E0A0B06E6D4D4D400062E0A0806E6D4D4D400062E0A0906E6D4D4D400062E0A1606E6D4D4D40007CA0A1706E6D4D4D40007CA0A1406E6D4D4D40007CA0A1506E6D4D4D40007CA0A1206E6D4D4D40007CA0A1306E6D4D4D40007CA0A1006E6D4D4D40007CA0A1106E6D4D4D40007CA0A1E06E6D4D4D40007CA0A1F06E6D4D4D40007CA0A1C06E6D4D4D40007CA0A1D06E6D4D4D40007CA0A1A06E6D4D4D40007CA0A1B06E6D4D4D40007CA0A1806E6D4D4D40007CA0A1906E6D4D4D40007CA0BE606E6D4D4D40007CA0BE706E6D4D4D40007CA0BE406E6D4D4D40007CA0BE506E6D4D4D40007CA0BE206E6D4D4D40007CA0B2D06E6D4D4D40006E60B2A06E6D4D4D40006E60BE306E6D4D4D40007CA02D606E6D4D4D40007CA029F06E6D4D4D400062E0B9406E6D4D4D40006820BE006E6D4D4D40007CA0BE106E6D4D4D40007CA0BEE06E6D4D4D40007CA0BEF06E6D4D4D40007CA02C106E6D4D4D400C5B602CE06E6D4D4D400C5B602CF06E6D4D4D400674E02CC06E6D4D4D400674E051006E6D4D4D400062E02FA06E6D4D4D400062E02CA06E6D4D4D40006B602CB06E6D4D4D40006A0051106E6D4D4D400062E02FD06E6D4D4D400062E0B9506E6D4D4D40006820B9206E6D4D4D40006820B9306E6D4D4D40006820B9006E6D4D4D40006820B9106E6D4D4D40006820B9E06E6D4D4D40006820B9F06E6D4D4D40006820BEC06E6D4D4D40006820BED06E6D4D4D40006820BEA06E6D4D4D40006820BEB06E6D4D4D40006820BE806E6D4D4D40006820BE906E6D4D4D40006820BF606E6D4D4D40006820BF706E6D4D4D40006820BF406E6D4D4D40006820BF506E6D4D4D40006820BF206E6D4D4D40006820BF306E6D4D4D40006820BF006E6D4D4D40006820BF106E6D4D4D400068202DB06E6D4D4D40006E70B9C06E6D4D4D40006820BFE06E6D4D4D40006820BFF06E6D4D4D400068202A706E6D4D4D40006E70B9D06E6D4D4D40006820BFC06E6D4D4D400068202D106E6D4D4D40006E702DD06E6D4D4D40006E402DA06E6D4D4D40006EC02D906E6D4D4D40006E402A606E6D4D4D40006EC02A506E6D4D4D40006E402A206E6D4D4D40006EC02A106E6D4D4D40006E402AE06E6D4D4D40006EC02AD06E6D4D4D40006E402AA06E6D4D4D40006EC02A906E6D4D4D40006E402B606E6D4D4D40006EC0BFD06E6D4D4D40006820BFA06E6D4D4D40006820BFB06E6D4D4D40006820BF806E6D4D4D40006820BF906E6D4D4D40006820BC606E6D4D4D40006820BC706E6D4D4D40006820BC406E6D4D4D40006820BC506E6D4D4D40006820BC206E6D4D4D40006820BC306E6D4D4D40006820BC006E6D4D4D40006820BC106E6D4D4D40006820BCE06E6D4D4D40006820BCF06E6D4D4D40006820BCC06E6D4D4D40006820BCD06E6D4D4D40006820BCA06E6D4D4D40006820BCB06E6D4D4D40006820BC806E6D4D4D40006820BC906E6D4D4D40006820BD606E6D4D4D40006820BD706E6D4D4D40006820BD406E6D4D4D40006820BD506E6D4D4D40006820BD206E6D4D4D40006820BD306E6D4D4D40006820BD006E6D4D4D40006820BD106E6D4D4D40006820BDE06E6D4D4D40006820BDF06E6D4D4D40006820BDC06E6D4D4D40006820BDD06E6D4D4D40006820BDA06E6D4D4D40006820BDB06E6D4D4D40006820B9A06E6D4D4D40006820BD806E6D4D4D40006820BD906E6D4D4D40006820BA606E6D4D4D40006820BA706E6D4D4D40006820BA406E6D4D4D40006820BA506E6D4D4D40006820BA206E6D4D4D40006820BA306E6D4D4D40006820BA006E6D4D4D40006820BA106E6D4D4D40006820BAE06E6D4D4D40006820BAF06E6D4D4D40006820BAC06E6D4D4D40006820BBE06E6D4D4D40006820BBF06E6D4D4D40006820BBC06E6D4D4D40006820BBD06E6D4D4D40006820BBA06E6D4D4D40006820BBB06E6D4D4D40006820BB806E6D4D4D40006820BB906E6D4D4D40006820B8606E6D4D4D40006820B8706E6D4D4D40006820B8406E6D4D4D40006820B8506E6D4D4D40006820B8206E6D4D4D400068202D706E6D4D4D40007CA02D406E6D4D4D40007CA026E06E6D4D4D40007CA0B9B06E6D4D4D40006820B9806E6D4D4D40006820B6A06E6D4D4D40006820B6B06E6D4D4D4000682029C06E6D4D4D40006E60B6806E6D4D4D4000682029D06E6D4D4D40006E60B6906E6D4D4D40006820A6E06E6D4D4D40006E60A6F06E6D4D4D40006E60A6C06E6D4D4D40006E60A6D06E6D4D4D40006E60A6A06E6D4D4D40006E60A6B06E6D4D4D40006E60A6806E6D4D4D40006E60A6906E6D4D4D40006E60A7606E6D4D4D40006E60A7706E6D4D4D40006E602E406E6D4D4D40005010A7406E6D4D4D40006E60A7506E6D4D4D40006E602D006E6D4D4D40006E60A7206E6D4D4D40006E6026606E6D4D4D400028C0A4406E6D4D4D40006E60A4506E6D4D4D40006E6026C06E6D4D4D40006E7026D06E6D4D4D40006E5026A06E6D4D4D40006E3026B06E6D4D4D40006E70A4206E6D4D4D40006E6026906E6D4D4D40006E7027606E6D4D4D40006E5027706E6D4D4D40006E50A4306E6D4D4D40006E6027506E6D4D4D40006E7027206E6D4D4D40006E7027306E6D4D4D40006E70A4006E6D4D4D40006E60A4106E6D4D4D40006E60A4E06E6D4D4D40006E60A4F06E6D4D4D40006E60A4C06E6D4D4D40006E60A4D06E6D4D4D40006E60A4A06E6D4D4D40006E60A4B06E6D4D4D40006E60A4806E6D4D4D40006E6029E06E6D4D4D40006E602A306E6D4D4D40006E402A006E6D4D4D40006E302AF06E6D4D4D40006E402AC06E6D4D4D40006E302AB06E6D4D4D40006E402A806E6D4D4D40006E3027106E6D4D4D40006E2027E06E6D4D4D40006EC027F06E6D4D4D40006E2027C06E6D4D4D40006EC027D06E6D4D4D40006E40B7606E6D4D4D40006820B7706E6D4D4D40006820B7406E6D4D4D40006820B7506E6D4D4D40006820B7206E6D4D4D40006820B7306E6D4D4D40006820B7006E6D4D4D40006820B7106E6D4D4D40006820B7E06E6D4D4D40006820B3C06E6D4D4D40006E60D3406E6D4D4D40006820D3506E6D4D4D40006820B3D06E6D4D4D40006E6026706E6D4D4D40006E60D5E06E6D4D4D40006820D5F06E6D4D4D40006820D5C06E6D4D4D40006820D5D06E6D4D4D40006820D5A06E6D4D4D40006820D5B06E6D4D4D40006820D5806E6D4D4D40006820D5906E6D4D4D40006820D2606E6D4D4D40006820D2706E6D4D4D40006820D2406E6D4D4D40006820D2506E6D4D4D40006820D2206E6D4D4D40006820D3206E6D4D4D40006820D3306E6D4D4D40006820D3006E6D4D4D40006820D3106E6D4D4D40006820D3E06E6D4D4D40006820D2306E6D4D4D40006820D2006E6D4D4D40006820D2106E6D4D4D40006820D2E06E6D4D4D40006820D2F06E6D4D4D40006820D2C06E6D4D4D40006820D2D06E6D4D4D40006820D2A06E6D4D4D40006820D2B06E6D4D4D40006820D2806E6D4D4D40006820D2906E6D4D4D40006820D3606E6D4D4D40006820D3706E6D4D4D400068202E306E6D4D4D40006F802E106E6D4D4D40006820D3F06E6D4D4D40006820D0A06E6D4D4D40006820D0B06E6D4D4D40006820D0806E6D4D4D40006820D0906E6D4D4D40006820D1606E6D4D4D40006820D1706E6D4D4D40006820D1406E6D4D4D40006820D1506E6D4D4D40006820D1206E6D4D4D40006820D3C06E6D4D4D400068202B406E6D4D4D40006E60D1306E6D4D4D40006820D1006E6D4D4D40006820D1106E6D4D4D40006820D1E06E6D4D4D40006820AE006E6D4D4D40006820AE106E6D4D4D40006820AEE06E6D4D4D40006820AEF06E6D4D4D40006820AEC06E6D4D4D40006820AED06E6D4D4D40006820AEA06E6D4D4D40006820AEB06E6D4D4D40006820AE806E6D4D4D40006820AE906E6D4D4D40006820AF606E6D4D4D4000682026406E6D4D4D40006E60AF706E6D4D4D40006820B3A06E6D4D4D40006E60AB206E6D4D4D40006E60B3B06E6D4D4D40006E60D3D06E6D4D4D40006820D3A06E6D4D4D40006820D3B06E6D4D4D40006820AB306E6D4D4D40006E60AB006E6D4D4D40006E60AB106E6D4D4D40006E60ABE06E6D4D4D40006E60ABF06E6D4D4D40006E60ABC06E6D4D4D40006E60ABD06E6D4D4D40006E60ABA06E6D4D4D40006E60ABB06E6D4D4D40006E60AB806E6D4D4D40006E60AB906E6D4D4D40006E60A8606E6D4D4D40006E60A8806E6D4D4D40006E60A8906E6D4D4D40006E60A9606E6D4D4D40006E60A9706E6D4D4D40006E60A9406E6D4D4D40006E60A9506E6D4D4D40006E60A9206E6D4D4D40006E60A9306E6D4D4D40006E60A9006E6D4D4D40006E60A9106E6D4D4D40006E60A9E06E6D4D4D40006E60A9F06E6D4D4D40006E60A9C06E6D4D4D40006E60D3806E6D4D4D40006820D3906E6D4D4D40006820D0606E6D4D4D40006820D0706E6D4D4D40006820D0406E6D4D4D40006820D0506E6D4D4D40006820D0206E6D4D4D40006820D0306E6D4D4D40006820D0006E6D4D4D40006820D0106E6D4D4D40006820D0E06E6D4D4D40006820D0F06E6D4D4D40006820D0C06E6D4D4D40006820D0D06E6D4D4D40006820B3806E6D4D4D40006E60B3906E6D4D4D40006E60B0606E6D4D4D40006E60B0706E6D4D4D40006E60B0406E6D4D4D40006E60B0506E6D4D4D40006E60B0206E6D4D4D40006E60B0306E6D4D4D40006E60B0006E6D4D4D40006E60B1206E6D4D4D40006E60B1306E6D4D4D40006E60B1006E6D4D4D40006E60B1106E6D4D4D40006E60B1E06E6D4D4D40006E60B1F06E6D4D4D40006E60B1C06E6D4D4D40006E60B1D06E6D4D4D40006E60B1A06E6D4D4D40006E60B1B06E6D4D4D40006E60B1806E6D4D4D40006E60B1906E6D4D4D40006E608E606E6D4D4D40006E6029B06E6D4D4D40006F20AF406E6D4D4D4000682026006E6D4D4D40006E70AC606E6D4D4D40006820AC706E6D4D4D40006820AC406E6D4D4D40006820AC506E6D4D4D40006820AC206E6D4D4D40006820AC306E6D4D4D40006820AC006E6D4D4D40006820AC106E6D4D4D40006820ACE06E6D4D4D40006820ACF06E6D4D4D40006820ACC06E6D4D4D40006820ACD06E6D4D4D40006820ACA06E6D4D4D4000682027A06E6D4D4D40006E30ADC06E6D4D4D40006820ADD06E6D4D4D40006820ADA06E6D4D4D40006820ADB06E6D4D4D40006820AD806E6D4D4D40006820AD906E6D4D4D40006820AA606E6D4D4D40006820AA706E6D4D4D40006820AA406E6D4D4D40006820AA506E6D4D4D40006820AA206E6D4D4D40006820AA306E6D4D4D40006820AA006E6D4D4D4000682")
-	bf.WriteBytes(data)
-
 	bf.WriteUint16(uint16(len(vsQuestItems)))
-	bf.WriteUint32(uint32(len(vsQuestBets)))
+	bf.WriteUint16(0) // Unk array of uint16s
+	bf.WriteUint16(uint16(len(vsQuestBets)))
 	bf.WriteUint16(0) // Unk
 
 	for i := range vsQuestItems {
@@ -145,7 +641,16 @@ func handleMsgMhfEnumerateQuest(s *Session, p mhfpacket.MHFPacket) {
 	bf.WriteUint16(pkt.Offset)
 	bf.Seek(0, io.SeekStart)
 	bf.WriteUint16(returnedCount)
+
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
+}
+
+func getTuneValueRange(start uint16, value uint16) []tuneValue {
+	var tv []tuneValue
+	for i := uint16(0); i < 13; i++ {
+		tv = append(tv, tuneValue{start + i, value})
+	}
+	return tv
 }
 
 func handleMsgMhfEnterTournamentQuest(s *Session, p mhfpacket.MHFPacket) {}

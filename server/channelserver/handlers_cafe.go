@@ -94,7 +94,7 @@ func handleMsgMhfGetCafeDuration(s *Session, p mhfpacket.MHFPacket) {
 	}
 	bf.WriteUint32(cafeTime) // Total cafe time
 	bf.WriteUint16(0)
-	ps.Uint16(bf, fmt.Sprintf(s.server.dict["cafeReset"], int(cafeReset.Month()), cafeReset.Day()), true)
+	ps.Uint16(bf, fmt.Sprintf(s.server.i18n.cafe.reset, int(cafeReset.Month()), cafeReset.Day()), true)
 
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
@@ -220,7 +220,7 @@ func addPointNetcafe(s *Session, p int) error {
 func handleMsgMhfStartBoostTime(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfStartBoostTime)
 	bf := byteframe.NewByteFrame()
-	boostLimit := TimeAdjusted().Add(time.Duration(s.server.erupeConfig.GameplayOptions.BoostTimeDuration) * time.Minute)
+	boostLimit := TimeAdjusted().Add(time.Duration(s.server.erupeConfig.GameplayOptions.BoostTimeDuration) * time.Second)
 	if s.server.erupeConfig.GameplayOptions.DisableBoostTime {
 		bf.WriteUint32(0)
 		doAckBufSucceed(s, pkt.AckHandle, bf.Data())
@@ -270,6 +270,12 @@ func handleMsgMhfPostBoostTimeQuestReturn(s *Session, p mhfpacket.MHFPacket) {
 	doAckSimpleSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x00})
 }
 
-func handleMsgMhfPostBoostTime(s *Session, p mhfpacket.MHFPacket) {}
+func handleMsgMhfPostBoostTime(s *Session, p mhfpacket.MHFPacket) {
+	pkt := p.(*mhfpacket.MsgMhfPostBoostTime)
+	doAckSimpleSucceed(s, pkt.AckHandle, make([]byte, 4))
+}
 
-func handleMsgMhfPostBoostTimeLimit(s *Session, p mhfpacket.MHFPacket) {}
+func handleMsgMhfPostBoostTimeLimit(s *Session, p mhfpacket.MHFPacket) {
+	pkt := p.(*mhfpacket.MsgMhfPostBoostTimeLimit)
+	doAckSimpleSucceed(s, pkt.AckHandle, make([]byte, 4))
+}

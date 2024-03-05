@@ -2,6 +2,7 @@ package stringsupport
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -68,7 +69,7 @@ func CSVRemove(csv string, v int) string {
 func CSVContains(csv string, v int) bool {
 	s := strings.Split(csv, ",")
 	for i := 0; i < len(s); i++ {
-		j, _ := strconv.ParseInt(s[i], 10, 64)
+		j, _ := strconv.ParseInt(s[i], 10, 32)
 		if int(j) == v {
 			return true
 		}
@@ -91,8 +92,28 @@ func CSVElems(csv string) []int {
 	}
 	s := strings.Split(csv, ",")
 	for i := 0; i < len(s); i++ {
-		j, _ := strconv.ParseInt(s[i], 10, 64)
+		j, _ := strconv.ParseInt(s[i], 10, 32)
 		r = append(r, int(j))
 	}
 	return r
+}
+
+func CSVGetIndex(csv string, i int) int {
+	s := CSVElems(csv)
+	if i < len(s) {
+		return s[i]
+	}
+	return 0
+}
+
+func CSVSetIndex(csv string, i int, v int) string {
+	s := CSVElems(csv)
+	if i < len(s) {
+		s[i] = v
+	}
+	var r []string
+	for j := 0; j < len(s); j++ {
+		r = append(r, fmt.Sprintf(`%d`, s[j]))
+	}
+	return strings.Join(r, ",")
 }
