@@ -32,16 +32,21 @@ func (m *MsgMhfStampcardStamp) Opcode() network.PacketID {
 func (m *MsgMhfStampcardStamp) Parse(bf *byteframe.ByteFrame, ctx *clientctx.ClientContext) error {
 	m.AckHandle = bf.ReadUint32()
 	m.HR = bf.ReadUint16()
-	m.GR = bf.ReadUint16()
+	if _config.ErupeConfig.RealClientMode >= _config.G1 {
+		m.GR = bf.ReadUint16()
+	}
 	m.Stamps = bf.ReadUint16()
 	bf.ReadUint16() // Zeroed
-	if _config.ErupeConfig.RealClientMode > _config.Z1 {
+	if _config.ErupeConfig.RealClientMode >= _config.Z2 {
 		m.Reward1 = uint16(bf.ReadUint32())
 		m.Reward2 = uint16(bf.ReadUint32())
 		m.Item1 = uint16(bf.ReadUint32())
 		m.Item2 = uint16(bf.ReadUint32())
 		m.Quantity1 = uint16(bf.ReadUint32())
 		m.Quantity2 = uint16(bf.ReadUint32())
+	} else {
+		m.Reward1 = 10
+		m.Reward2 = 10
 	}
 	return nil
 }

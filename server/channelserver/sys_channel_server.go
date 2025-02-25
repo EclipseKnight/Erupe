@@ -207,6 +207,7 @@ func (s *Server) Start() error {
 
 	go s.acceptClients()
 	go s.manageSessions()
+	go s.invalidateSessions()
 
 	// Start the discord bot for chat integration.
 	if s.erupeConfig.Discord.Enabled && s.discordBot != nil {
@@ -276,6 +277,16 @@ func (s *Server) manageSessions() {
 			s.Unlock()
 		}
 	}
+}
+
+func (s *Server) invalidateSessions() {
+	for _, session := range s.sessions {
+		if time.Now().Add(-30 * time.Second).After(session.lastPacket) {
+			s.logger.Info("Session timeout", zap.String("Name", session.Name))
+			logoutPlayer(session)
+		}
+	}
+	time.Sleep(30 * time.Second)
 }
 
 // BroadcastMHF queues a MHFPacket to be sent to all sessions.
@@ -367,6 +378,14 @@ func (s *Server) DiscordChannelSend(charName string, content string) {
 	}
 }
 
+func (s *Server) DiscordScreenShotSend(charName string, title string, description string, articleToken string) {
+	if s.erupeConfig.Discord.Enabled && s.discordBot != nil {
+		imageUrl := fmt.Sprintf("%s:%d/api/ss/bbs/%s", s.erupeConfig.Screenshots.Host, s.erupeConfig.Screenshots.Port, articleToken)
+		message := fmt.Sprintf("**%s**: %s - %s %s", charName, title, description, imageUrl)
+		s.discordBot.RealtimeChannelSend(message)
+	}
+}
+
 func (s *Server) FindSessionByCharID(charID uint32) *Session {
 	for _, c := range s.Channels {
 		for _, session := range c.sessions {
@@ -416,24 +435,13 @@ func (s *Server) FindObjectByChar(charID uint32) *Object {
 	return nil
 }
 
-func (s *Server) NextSemaphoreID() uint32 {
-	for {
-		exists := false
-		s.semaphoreIndex = s.semaphoreIndex + 1
-		if s.semaphoreIndex > 0xFFFF {
-			s.semaphoreIndex = 1
-		}
-		for _, semaphore := range s.semaphore {
-			if semaphore.id == s.semaphoreIndex {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			break
+func (s *Server) HasSemaphore(ses *Session) bool {
+	for _, semaphore := range s.semaphore {
+		if semaphore.host == ses {
+			return true
 		}
 	}
-	return s.semaphoreIndex
+	return false
 }
 
 func (s *Server) Season() uint8 {

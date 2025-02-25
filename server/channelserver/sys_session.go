@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"erupe-ce/common/mhfcourse"
+	_config "erupe-ce/config"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"erupe-ce/network"
 	"erupe-ce/network/clientctx"
 	"erupe-ce/network/mhfpacket"
+
 	"go.uber.org/zap"
 )
 
@@ -48,7 +50,12 @@ type Session struct {
 	kqf              []byte
 	kqfOverride      bool
 
-	semaphore *Semaphore // Required for the stateful MsgSysUnreserveStage packet.
+	playtime     uint32
+	playtimeTime time.Time
+
+	semaphore     *Semaphore // Required for the stateful MsgSysUnreserveStage packet.
+	semaphoreMode bool
+	semaphoreID   []uint16
 
 	// A stack containing the stage movement history (push on enter/move, pop on back)
 	stageMoveStack *stringstack.StringStack
@@ -79,6 +86,7 @@ func NewSession(server *Server, conn net.Conn) *Session {
 		sessionStart:   TimeAdjusted().Unix(),
 		stageMoveStack: stringstack.New(),
 		ackStart:       make(map[uint32]time.Time),
+		semaphoreID:    make([]uint16, 2),
 	}
 	s.SetObjectID()
 	return s
@@ -160,16 +168,12 @@ func (s *Session) sendLoop() {
 				s.logger.Warn("Failed to send packet")
 			}
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(time.Duration(_config.ErupeConfig.LoopDelay) * time.Millisecond)
 	}
 }
 
 func (s *Session) recvLoop() {
 	for {
-		if time.Now().Add(-30 * time.Second).After(s.lastPacket) {
-			logoutPlayer(s)
-			return
-		}
 		if s.closed {
 			logoutPlayer(s)
 			return
@@ -185,7 +189,7 @@ func (s *Session) recvLoop() {
 			return
 		}
 		s.handlePacketGroup(pkt)
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(time.Duration(_config.ErupeConfig.LoopDelay) * time.Millisecond)
 	}
 }
 
@@ -272,7 +276,7 @@ func (s *Session) logMessage(opcode uint16, data []byte, sender string, recipien
 	} else {
 		fmt.Printf("[%s] -> [%s]\n", sender, recipient)
 	}
-	fmt.Printf("Opcode: %s\n", opcodePID)
+	fmt.Printf("Opcode: (Dec: %d Hex: 0x%04X Name: %s) \n", opcode, opcode, opcodePID)
 	if s.server.erupeConfig.DebugOptions.LogMessageData {
 		if len(data) <= s.server.erupeConfig.DebugOptions.MaxHexdumpLength {
 			fmt.Printf("Data [%d bytes]:\n%s\n", len(data), hex.Dump(data))
@@ -308,6 +312,14 @@ func (s *Session) NextObjectID() uint32 {
 	bf.WriteUint16(s.objectIndex)
 	bf.Seek(0, 0)
 	return bf.ReadUint32()
+}
+
+func (s *Session) GetSemaphoreID() uint32 {
+	if s.semaphoreMode {
+		return 0x000E0000 + uint32(s.semaphoreID[1])
+	} else {
+		return 0x000F0000 + uint32(s.semaphoreID[0])
+	}
 }
 
 func (s *Session) isOp() bool {

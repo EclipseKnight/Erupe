@@ -9,12 +9,19 @@
   ],
   "PatchServerManifest": "",
   "PatchServerFile": "",
-  "ScreenshotAPIURL": "",
+  "Screenshots":{
+    "Enabled":true,
+    "Host":"127.0.0.1",
+    "Port":8080,
+    "OutputDir":"screenshots",
+    "UploadQuality":100
+  },
   "DeleteOnSaveCorruption": false,
   "ClientMode": "ZZ",
   "QuestCacheExpiry": 300,
   "CommandPrefix": "!",
   "AutoCreateAccount": true,
+  "LoopDelay": 50,
   "DefaultCourses": [1, 23, 24],
   "EarthStatus": 0,
   "EarthID": 0,
@@ -163,6 +170,11 @@
       "Enabled": true,
       "Description": "Toggle the Quest timer",
       "Prefix": "timer"
+    }, {
+      "Name": "Playtime",
+      "Enabled": true,
+      "Description": "Show your playtime",
+      "Prefix": "playtime"
     }
   ],
   "Courses": [
@@ -189,8 +201,8 @@
     "Enabled": true,
     "Port": 53312
   },
-  "SignV2": {
-    "Enabled": false,
+  "API": {
+    "Enabled": true,
     "Port": 8080,
     "PatchServer": "",
     "Banners": [],
